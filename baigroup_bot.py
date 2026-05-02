@@ -56,14 +56,23 @@ async def consultar_cheques_rechazados(cuit: str) -> dict:
     cuit_limpio = re.sub(r"[-\s]", "", cuit)
     url = f"https://api.bcra.gob.ar/centraldedeudores/v1.0/cheques/{cuit_limpio}"
     try:
-        async with httpx.AsyncClient(timeout=15, verify=False) as client:
-            r = await client.get(url)
+        async with httpx.AsyncClient(timeout=15, verify=False, follow_redirects=True) as client:
+            r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
             if r.status_code == 200:
-                return {"ok": True, "data": r.json()}
+                data = r.json()
+                cheques = []
+                results = data.get("results", {})
+                if isinstance(results, dict):
+                    cheques = results.get("cheques", [])
+                elif isinstance(results, list):
+                    cheques = results
+                if not cheques:
+                    cheques = data.get("cheques", [])
+                return {"ok": True, "cheques": cheques}
             else:
-                return {"ok": True, "data": {"results": {"cheques": []}}}
+                return {"ok": True, "cheques": []}
     except:
-        return {"ok": True, "data": {"results": {"cheques": []}}}
+        return {"ok": True, "cheques": []}
 
 # ─────────────────────────────────────────────
 # CLAUDE ANALYSIS
@@ -82,8 +91,8 @@ Analizá la siguiente información del BCRA para el CUIT {cuit} y generá un inf
 DATOS BCRA:
 {json.dumps(bcra_data, ensure_ascii=False, indent=2)}
 
-CHEQUES RECHAZADOS:
-{json.dumps(cheques_data, ensure_ascii=False, indent=2)}
+CHEQUES RECHAZADOS ({len(cheques_data.get("cheques", []))} registros):
+{json.dumps(cheques_data.get("cheques", [])[:5], ensure_ascii=False, indent=2)}
 
 POLÍTICA CREDITICIA BAI GROUP:
 - Solo aceptamos libradores en Situación 1 o máximo Situación 2 (con justificación)
@@ -144,7 +153,7 @@ def analizar_sin_claude(cuit: str, bcra_data: dict, cheques_data: dict) -> str:
                 entidades_lineas.append(f"• {nombre_entidad}: Sit. {sit} | ${monto:,}k")
         
         # Cheques rechazados
-        cheques = cheques_data.get("data", {}).get("results", {}).get("cheques", [])
+        cheques = cheques_data.get("cheques", [])
         if cheques:
             alertas.append(f"⚠️ {len(cheques)} cheque(s) rechazado(s)")
         
