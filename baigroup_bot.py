@@ -54,7 +54,7 @@ async def consultar_bcra(cuit: str) -> dict:
 
 async def consultar_cheques_rechazados(cuit: str) -> dict:
     cuit_limpio = re.sub(r"[-\s]", "", cuit)
-    url = f"https://api.bcra.gob.ar/centraldedeudores/v1.0/cheques/{cuit_limpio}"
+    url = f"https://api.bcra.gob.ar/centraldedeudores/v1.0/cheques/{cuit_limpio}/rechazados"
     try:
         async with httpx.AsyncClient(timeout=15, verify=False, follow_redirects=True) as client:
             r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -155,7 +155,16 @@ def analizar_sin_claude(cuit: str, bcra_data: dict, cheques_data: dict) -> str:
         # Cheques rechazados
         cheques = cheques_data.get("cheques", [])
         if cheques:
-            alertas.append(f"⚠️ {len(cheques)} cheque(s) rechazado(s)")
+            # Contar solo SIN FONDOS vs otros
+            sin_fondos = [c for c in cheques if "FONDOS" in str(c).upper()]
+            total = len(cheques)
+            alertas.append(f"🔴 {total} cheque(s) rechazado(s) — {len(sin_fondos)} por SIN FONDOS")
+            # Mostrar los 3 más recientes
+            for c in cheques[:3]:
+                fecha = c.get("fechaRechazo", c.get("fecha", ""))
+                monto = c.get("monto", "")
+                causal = c.get("causal", c.get("causa", ""))
+                alertas.append(f"  → {fecha} | ${monto:,} | {causal}")
         
         # Semáforo
         if sit_actual == 1 and not cheques:
