@@ -34,21 +34,6 @@ async def consultar_bcra(cuit: str) -> dict:
                 return {"ok": False, "error": "CUIT no encontrado en Central de Deudores — puede no tener deuda registrada"}
             else:
                 return {"ok": False, "error": f"Error BCRA HTTP {r.status_code}"}
-    except httpx.SSLError:
-        # Fallback: intentar sin verificacion SSL estricta
-        try:
-            import ssl
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            async with httpx.AsyncClient(timeout=20, verify=False) as client:
-                r = await client.get(url, headers=headers)
-                if r.status_code == 200:
-                    return {"ok": True, "data": r.json()}
-                else:
-                    return {"ok": False, "error": f"Error BCRA: {r.status_code}"}
-        except Exception as e2:
-            return {"ok": False, "error": f"SSL Error: {str(e2)}"}
     except Exception as e:
         return {"ok": False, "error": f"Conexión fallida: {str(e)}"}
 
