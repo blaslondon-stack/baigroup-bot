@@ -24,18 +24,30 @@ async def consultar_bcra(cuit: str) -> dict:
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
         "Accept": "application/json",
+        "Accept-Language": "es-AR,es;q=0.9",
     }
-    try:
-        async with httpx.AsyncClient(timeout=20, verify=False, follow_redirects=True) as client:
-            r = await client.get(url, headers=headers)
-            if r.status_code == 200:
-                return {"ok": True, "data": r.json()}
-            elif r.status_code == 404:
-                return {"ok": False, "error": "CUIT no encontrado en Central de Deudores — puede no tener deuda registrada"}
-            else:
-                return {"ok": False, "error": f"Error BCRA HTTP {r.status_code}"}
-    except Exception as e:
-        return {"ok": False, "error": f"Conexión fallida: {str(e)}"}
+    # Intentar hasta 3 veces
+    for intento in range(3):
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(30.0, connect=10.0),
+                verify=False,
+                follow_redirects=True
+            ) as client:
+                r = await client.get(url, headers=headers)
+                if r.status_code == 200:
+                    return {"ok": True, "data": r.json()}
+                elif r.status_code == 404:
+                    return {"ok": False, "error": "CUIT sin deuda registrada en Central de Deudores"}
+                elif r.status_code == 401 or r.status_code == 403:
+                    return {"ok": False, "error": f"BCRA bloqueó la consulta (HTTP {r.status_code}) — intentá en unos minutos"}
+                else:
+                    return {"ok": False, "error": f"Error BCRA HTTP {r.status_code}"}
+        except Exception as e:
+            if intento < 2:
+                await asyncio.sleep(2)
+                continue
+            return {"ok": False, "error": f"Sin conexión con BCRA luego de 3 intentos: {str(e)}"}
 
 async def consultar_cheques_rechazados(cuit: str) -> dict:
     cuit_limpio = re.sub(r"[-\s]", "", cuit)
