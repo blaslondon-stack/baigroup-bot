@@ -12,6 +12,21 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 TELEGRAM_TOKEN = "8764473072:AAG1v2uRuyNFaxxW9gl_xddwZNS2cx4Bvwc"
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
+# SEGURIDAD — solo responde en este grupo y a este usuario
+GRUPO_PERMITIDO = -5265832156
+USUARIOS_PERMITIDOS = {55179603}  # Agregar más IDs acá si sumás equipo
+
+async def check_acceso(update: Update) -> bool:
+    """Verifica que el mensaje viene del grupo autorizado o del usuario autorizado"""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else None
+    # Permitir si es el grupo correcto O el usuario autorizado en privado
+    if chat_id == GRUPO_PERMITIDO:
+        return True
+    if user_id in USUARIOS_PERMITIDOS:
+        return True
+    return False
+
 # In-memory cartera (para demo - en produccion usar DB)
 cartera = {}
 
@@ -211,6 +226,7 @@ def calcular_descuento(monto: float, dias: int, tna: float) -> dict:
 # COMANDOS
 # ─────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_acceso(update): return
     texto = """🏦 *BAI Group SA — Bot Operativo*
 
 Comandos disponibles:
@@ -230,6 +246,7 @@ _Ej: /cheques_"""
     await update.message.reply_text(texto, parse_mode="Markdown")
 
 async def evaluar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_acceso(update): return
     if not context.args:
         await update.message.reply_text("❌ Usá: `/evaluar [CUIT]`\nEj: `/evaluar 30578639868`", parse_mode="Markdown")
         return
@@ -253,6 +270,7 @@ async def evaluar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text(analisis, parse_mode="Markdown")
 
 async def cotizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_acceso(update): return
     if len(context.args) < 3:
         await update.message.reply_text(
             "❌ Usá: `/cotizar [monto] [días] [tna]`\nEj: `/cotizar 1000000 90 85`",
@@ -296,6 +314,7 @@ _Vence en {dias} días — {(datetime.now() + timedelta(days=dias)).strftime('%d
         await update.message.reply_text("❌ Datos inválidos. Usá números: `/cotizar 1000000 90 85`", parse_mode="Markdown")
 
 async def nuevo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_acceso(update): return
     if len(context.args) < 4:
         await update.message.reply_text(
             "❌ Usá: `/nuevo [CUIT] [monto] [días] [tna]`\nEj: `/nuevo 30578639868 1000000 90 85`",
@@ -340,6 +359,7 @@ async def nuevo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Datos inválidos.", parse_mode="Markdown")
 
 async def vencer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_acceso(update): return
     hoy = datetime.now()
     proximos = []
 
@@ -366,6 +386,7 @@ async def vencer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lineas), parse_mode="Markdown")
 
 async def cartera_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_acceso(update): return
     activas = {k: v for k, v in cartera.items() if v["estado"] == "activa"}
 
     if not activas:
@@ -480,6 +501,7 @@ async def leer_cheques_sheet() -> list:
         return []
 
 async def cheques_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_acceso(update): return
     """Muestra cheques pendientes de depositar (sin destinatario) del Google Sheet"""
     msg = await update.message.reply_text("📊 Consultando planilla de cheques...", parse_mode="Markdown")
 
@@ -552,6 +574,7 @@ async def cheques_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text("\n".join(lineas), parse_mode="Markdown")
 
 async def cheques_hoy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_acceso(update): return
     """Muestra solo los cheques disponibles para depositar HOY"""
     msg = await update.message.reply_text("Consultando cheques disponibles hoy...", parse_mode="Markdown")
     registros = await leer_cheques_sheet()
@@ -591,6 +614,7 @@ async def cheques_hoy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def semana_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_acceso(update): return
     """Muestra cheques que se acreditan en los próximos 7 días, separados por tipo"""
     msg = await update.message.reply_text("📅 Consultando próximos 7 días...", parse_mode="Markdown")
 
