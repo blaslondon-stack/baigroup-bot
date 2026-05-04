@@ -215,23 +215,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 Comandos disponibles:
 
-🔍 `/evaluar [CUIT]`
-Evaluación crediticia completa vía BCRA
-
-💰 `/cotizar [monto] [días] [tna]`
-Calcula el descuento de un cheque
-
-📋 `/nuevo [CUIT] [monto] [días] [tna]`
-Registra una operación nueva
-
-📅 `/vencer`
-Cheques que vencen en los próximos 7 días
-
-📊 `/cartera`
-Resumen de operaciones activas
+🔍 `/evaluar [CUIT]` — Evaluación crediticia vía BCRA
+💰 `/cotizar [monto] [días] [tna]` — Cotización de cheque
+📋 `/nuevo [CUIT] [monto] [días] [tna]` — Registrar operación
+📊 `/cheques` — Pendientes sin destinatario (Google Sheets)
+📅 `/hoy` — Disponibles para depositar hoy
+⏰ `/vencer` — Próximos a vencer en cartera interna
+📈 `/cartera` — Resumen cartera interna
 
 _Ej: /evaluar 30578639868_
-_Ej: /cotizar 1000000 90 85_"""
+_Ej: /cotizar 10.000.000 30 144_
+_Ej: /cheques_"""
     await update.message.reply_text(texto, parse_mode="Markdown")
 
 async def evaluar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -523,7 +517,10 @@ async def cheques_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             venc = p["vencimiento"]
             imp = p["importe"]
             cli = p["cliente"]
+            cuit = p["cuit"]
             lineas.append(f"• {venc} ({dias}d) | {titular} | ${imp:,.0f} | {cli}")
+            if cuit:
+                lineas.append(f"  👉 /evaluar {cuit}")
 
     if esta_semana:
         lineas.append(f"\n🟡 *PRÓXIMOS 30 DÍAS ({len(esta_semana)} cheques)*")
@@ -532,7 +529,10 @@ async def cheques_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             titular = p["titular"][:25]
             venc = p["vencimiento"]
             imp = p["importe"]
+            cuit = p["cuit"]
             lineas.append(f"• {venc} ({dias}d) | {titular} | ${imp:,.0f}")
+            if cuit:
+                lineas.append(f"  👉 /evaluar {cuit}")
 
     if mas_adelante:
         total_ma = sum(p["importe"] for p in mas_adelante)
@@ -578,8 +578,10 @@ async def cheques_hoy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         venc = p["vencimiento"]
         cuit = p["cuit"]
         linea = (f"{emoji} *{titular}* | {tipo} Nro:{numero} | "
-                 f"${imp:,.0f} | {cli} | Vence:{venc}({dias_venc}d) | CUIT:{cuit}")
+                 f"${imp:,.0f} | {cli} | Vence:{venc}({dias_venc}d)")
         lineas.append(linea)
+        if cuit:
+            lineas.append(f"   👉 /evaluar {cuit}")
     await msg.edit_text("\n".join(lineas), parse_mode="Markdown")
 
 
