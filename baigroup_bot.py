@@ -871,20 +871,44 @@ async def consultar_bcra_completo(cuit: str) -> dict:
             )
             page = await context.new_page()
             
-            # Navegar al BCRA — Cloudflare se resuelve automáticamente
+            # Navegar al BCRA
             await page.goto(
                 f"https://www.bcra.gob.ar/deudores/?cuit={cuit_limpio}",
-                wait_until="networkidle",
+                wait_until="domcontentloaded",
                 timeout=30000
             )
             
-            # Esperar a que cargue el contenido
-            await page.wait_for_timeout(3000)
+            # Esperar a que el JS genere el token y redirija
+            # La URL cambia de ?cuit=X a ?cuit=X&ts=Y&token=Z
+            try:
+                await page.wait_for_url(
+                    lambda url: "token=" in url,
+                    timeout=15000
+                )
+            except:
+                pass
+            
+            # Esperar a que cargue el contenido dinámico (cheques rechazados)
+            try:
+                await page.wait_for_selector(
+                    "text=Central de cheques rechazados",
+                    timeout=15000
+                )
+            except:
+                # Si no aparece cheques, esperar a que aparezca al menos el nombre
+                try:
+                    await page.wait_for_selector(
+                        "#deudores-resultados",
+                        timeout=10000
+                    )
+                except:
+                    await page.wait_for_timeout(5000)
+            
+            # Esperar un poco más para asegurar carga completa
+            await page.wait_for_timeout(2000)
             
             # Extraer el texto completo de la página
             texto = await page.inner_text("body")
-            
-            # También capturar la URL final (tiene el token)
             url_final = page.url
             
             await browser.close()
