@@ -103,43 +103,76 @@ async def analizar_con_claude(cuit: str, bcra_data: dict, cheques_data: dict) ->
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         
-        prompt = f"""Sos el agente de crédito de BAI Group SA, una financiera argentina especializada en descuento de cheques.
+        # Extraer flags críticos de la estructura BCRA
+        results_data = bcra_data.get("results", {})
+        periodos = results_data.get("periodos", [])
+        flags_detectados = []
+        for periodo in periodos:
+            for entidad in periodo.get("entidades", []):
+                nombre_e = entidad.get("entidad", "")
+                if entidad.get("refinanciaciones"):
+                    flags_detectados.append(f"⚠️ {nombre_e}: refinanciaciones activas")
+                if entidad.get("recategorizacionOblig"):
+                    flags_detectados.append(f"🔴 {nombre_e}: recategorización obligatoria por BCRA")
+                if entidad.get("situacionJuridica"):
+                    flags_detectados.append(f"🔴 {nombre_e}: situación jurídica (concurso/quiebra)")
+                if entidad.get("irrecDisposicionTecnica"):
+                    flags_detectados.append(f"🔴 {nombre_e}: irrecuperable por disposición técnica")
+                if entidad.get("procesoJud"):
+                    flags_detectados.append(f"🔴 {nombre_e}: proceso judicial activo")
+                if entidad.get("enRevision"):
+                    flags_detectados.append(f"⚠️ {nombre_e}: clasificación en revisión")
+                dias = entidad.get("diasAtrasoPago", 0) or 0
+                if dias > 0:
+                    flags_detectados.append(f"⚠️ {nombre_e}: {dias} días de atraso")
 
-Analizá la siguiente información del BCRA para el CUIT {cuit} y generá un informe de evaluación crediticia.
+        flags_txt = "\n".join(flags_detectados) if flags_detectados else "Ninguno"
 
-DATOS BCRA:
+        prompt = f"""Sos el agente de crédito de BAI Group SA, financiera argentina especializada en descuento de cheques.
+
+Analizá la siguiente información del BCRA para el CUIT {cuit}.
+
+DATOS BCRA COMPLETOS:
 {json.dumps(bcra_data, ensure_ascii=False, indent=2)}
 
-CHEQUES RECHAZADOS ({len(cheques_data.get("cheques", []))} registros):
+FLAGS CRÍTICOS DETECTADOS AUTOMÁTICAMENTE:
+{flags_txt}
+
+CHEQUES RECHAZADOS EN API ({len(cheques_data.get("cheques", []))} registros):
 {json.dumps(cheques_data.get("cheques", [])[:5], ensure_ascii=False, indent=2)}
 
-POLÍTICA CREDITICIA BAI GROUP:
-- Solo aceptamos libradores en Situación 1 o máximo Situación 2 (con justificación)
-- Situación 3 o superior: rechazo automático
-- Cheques rechazados en los últimos 6 meses: rechazo automático
-- Plazo máximo de cheques: 180 días
-- Vigilar saltos bruscos de deuda (posible refinanciación)
+SEMÁFORO BAI GROUP:
+✅ APROBAR: Sit 1 en todas las entidades, sin flags, sin refinanciaciones
+🟡 CON CONDICIONES: Sit 1 con algún flag menor (enRevision, días atraso leve) o Sit 2 con buen historial
+🟠 ALTO RIESGO: Sit 2 con flags, o Sit 1 con refinanciaciones/recategorización
+❌ RECHAZAR: Sit 3+ / situaciónJuridica / procesoJud / irrecDisposicionTecnica / recategorizacionOblig
 
-Respondé en este formato exacto con emojis:
+CRITERIOS ADICIONALES:
+- Refinanciaciones activas = empresa en dificultades, aumentar tasa o rechazar según monto
+- recategorizacionOblig = el BCRA la forzó a bajar categoría, muy negativo
+- Deuda con 3+ entidades simultáneas = analizar concentración
+- Monto total >$500M (en miles) = exposición alta, exigir mayor tasa
+
+Respondé en este formato:
 
 🏢 *LIBRADOR:* [nombre]
 🔢 *CUIT:* {cuit}
 
 📊 *SITUACIÓN ACTUAL:*
-[Lista cada entidad con situación y monto]
+[Cada entidad: nombre | Sit X | $monto | flags si tiene]
 
-🚨 *ALERTAS:*
-[Lista alertas detectadas o "Sin alertas"]
+🚨 *FLAGS DETECTADOS:*
+[Lista de flags o "Sin flags críticos ✅"]
 
-📋 *HISTORIAL:*
-[Resumen breve del comportamiento en 24 meses]
+💰 *EXPOSICIÓN TOTAL:*
+[Suma de deuda y cantidad de entidades]
 
 🎯 *RECOMENDACIÓN:*
-[✅ APROBAR / 🟡 APROBAR CON CONDICIONES / ❌ RECHAZAR]
-[Breve justificación en 1-2 líneas]
+[✅ APROBAR / 🟡 CON CONDICIONES / 🟠 ALTO RIESGO / ❌ RECHAZAR]
+[Justificación concreta en 2-3 líneas]
 
-⚠️ *CONDICIONES:*
-[Si aplica, qué condiciones poner]"""
+📋 *CONDICIONES:*
+[Tasa sugerida, monto máximo, o "Sin condiciones adicionales"]"""
 
         response = client.messages.create(
             model="claude-sonnet-4-6",
