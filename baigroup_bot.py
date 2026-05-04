@@ -400,6 +400,189 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.args = [cuit]
         await evaluar(update, context)
 
+
+# ─────────────────────────────────────────────
+# GOOGLE SHEETS — CHEQUES GENERALES
+# ─────────────────────────────────────────────
+SHEET_ID = "14WQLvak1U_1io5UlGfOMJnuvulOcVma4"
+SHEET_GID = "2101330974"
+
+def parse_csv_line(line):
+    """Parser CSV con manejo de comillas"""
+    result = []
+    current = ""
+    in_quotes = False
+    for char in line:
+        if char == '"':
+            in_quotes = not in_quotes
+        elif char == "," and not in_quotes:
+            result.append(current.strip())
+            current = ""
+        else:
+            current += char
+    result.append(current.strip())
+    return result
+
+def parse_fecha(s):
+    """Parsea fecha DD/MM/YYYY o D/M/YYYY"""
+    s = (s or "").strip()
+    try:
+        parts = s.split("/")
+        if len(parts) == 3:
+            return datetime(int(parts[2]), int(parts[1]), int(parts[0]))
+    except:
+        pass
+    return None
+
+def parse_importe(s):
+    """Parsea importe $1.000.000,00"""
+    try:
+        return float(re.sub(r"[\$, ]", "", s or ""))
+    except:
+        return 0
+
+async def leer_cheques_sheet() -> list:
+    """Lee el Google Sheet de cheques y retorna lista de registros"""
+    url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={SHEET_GID}"
+    try:
+        async with httpx.AsyncClient(timeout=30, verify=False, follow_redirects=True) as client:
+            r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code != 200:
+                return []
+        
+        lines = r.text.split("\n")
+        registros = []
+        
+        for line in lines[5:]:  # Skip 5 filas de header
+            cols = parse_csv_line(line)
+            if len(cols) < 10:
+                continue
+            titular = cols[4].strip()
+            importe_str = cols[6].strip()
+            if not titular or not importe_str:
+                continue
+            
+            registros.append({
+                "tipo": cols[0].strip(),          # ECHEQ / vacío
+                "fecha": cols[1].strip(),          # desde cuándo depositar
+                "fecha_dt": parse_fecha(cols[1]),
+                "numero": cols[3].strip(),
+                "titular": titular,
+                "cuit": cols[5].strip(),
+                "importe": parse_importe(importe_str),
+                "cliente": cols[7].strip(),
+                "destinatario": cols[8].strip(),   # vacío = pendiente
+                "vencimiento": cols[9].strip(),
+                "venc_dt": parse_fecha(cols[9]),
+                "estado": cols[11].strip() if len(cols) > 11 else "",
+            })
+        
+        return registros
+    except Exception as e:
+        return []
+
+async def cheques_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra cheques pendientes de depositar (sin destinatario) del Google Sheet"""
+    msg = await update.message.reply_text("📊 Consultando planilla de cheques...", parse_mode="Markdown")
+
+    registros = await leer_cheques_sheet()
+    if not registros:
+        await msg.edit_text("❌ No se pudo leer la planilla. Verificar acceso.", parse_mode="Markdown")
+        return
+
+    hoy = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    pendientes = [r for r in registros if not r["destinatario"] and r["venc_dt"] and r["venc_dt"] >= hoy]
+
+    if not pendientes:
+        await msg.edit_text("✅ No hay cheques pendientes sin destinatario.", parse_mode="Markdown")
+        return
+
+    pendientes.sort(key=lambda x: x["venc_dt"])
+
+    disponibles_hoy = [p for p in pendientes if p["fecha_dt"] and p["fecha_dt"] <= hoy]
+    no_disponibles = [p for p in pendientes if not p["fecha_dt"] or p["fecha_dt"] > hoy]
+
+    total = sum(p["importe"] for p in pendientes)
+    total_disp = sum(p["importe"] for p in disponibles_hoy)
+
+    urgentes = [p for p in disponibles_hoy if p["venc_dt"] and (p["venc_dt"] - hoy).days <= 7]
+    esta_semana = [p for p in disponibles_hoy if p["venc_dt"] and 7 < (p["venc_dt"] - hoy).days <= 30]
+    mas_adelante = [p for p in disponibles_hoy if p["venc_dt"] and (p["venc_dt"] - hoy).days > 30]
+
+    lineas = ["📋 *CHEQUES PENDIENTES — SIN DESTINATARIO*\n"]
+    lineas.append(f"💰 Total: {len(pendientes)} cheques | *${total:,.0f}*")
+    lineas.append(f"✅ Disponibles para depositar: {len(disponibles_hoy)} | *${total_disp:,.0f}*")
+    lineas.append(f"⏳ No disponibles aún: {len(no_disponibles)}\n")
+
+    if urgentes:
+        lineas.append(f"🔴 *URGENTE — vencen en 7 días ({len(urgentes)} cheques)*")
+        for p in urgentes[:10]:
+            dias = (p["venc_dt"] - hoy).days
+            titular = p["titular"][:25]
+            venc = p["vencimiento"]
+            imp = p["importe"]
+            cli = p["cliente"]
+            lineas.append(f"• {venc} ({dias}d) | {titular} | ${imp:,.0f} | {cli}")
+
+    if esta_semana:
+        lineas.append(f"\n🟡 *PRÓXIMOS 30 DÍAS ({len(esta_semana)} cheques)*")
+        for p in esta_semana[:8]:
+            dias = (p["venc_dt"] - hoy).days
+            titular = p["titular"][:25]
+            venc = p["vencimiento"]
+            imp = p["importe"]
+            lineas.append(f"• {venc} ({dias}d) | {titular} | ${imp:,.0f}")
+
+    if mas_adelante:
+        total_ma = sum(p["importe"] for p in mas_adelante)
+        lineas.append(f"\n🟢 *+30 DÍAS: {len(mas_adelante)} cheques — ${total_ma:,.0f}*")
+
+    if no_disponibles:
+        total_nd = sum(p["importe"] for p in no_disponibles)
+        proximos_nd = sorted(no_disponibles, key=lambda x: x["fecha_dt"] or datetime.max)[:3]
+        lineas.append(f"\n⏳ *NO DISPONIBLES AÚN — ${total_nd:,.0f}*")
+        for p in proximos_nd:
+            lineas.append(f"• Disponible {p['fecha']} | {p['titular'][:25]} | ${p['importe']:,.0f}")
+
+    await msg.edit_text("\n".join(lineas), parse_mode="Markdown")
+
+async def cheques_hoy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra solo los cheques disponibles para depositar HOY"""
+    msg = await update.message.reply_text("Consultando cheques disponibles hoy...", parse_mode="Markdown")
+    registros = await leer_cheques_sheet()
+    if not registros:
+        await msg.edit_text("No se pudo leer la planilla.", parse_mode="Markdown")
+        return
+    hoy = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    disponibles = [
+        r for r in registros
+        if not r["destinatario"]
+        and r["fecha_dt"] and r["fecha_dt"] <= hoy
+        and r["venc_dt"] and r["venc_dt"] >= hoy
+    ]
+    if not disponibles:
+        await msg.edit_text("No hay cheques disponibles para depositar hoy sin destinatario.", parse_mode="Markdown")
+        return
+    disponibles.sort(key=lambda x: x["venc_dt"])
+    total = sum(p["importe"] for p in disponibles)
+    lineas = ["*CHEQUES DISPONIBLES HOY*", f"Total: {len(disponibles)} cheques | ${total:,.0f}", ""]
+    for p in disponibles:
+        dias_venc = (p["venc_dt"] - hoy).days
+        tipo = "ECHEQ" if p["tipo"] == "ECHEQ" else "FISICO"
+        emoji = "🔴" if dias_venc <= 3 else "🟡" if dias_venc <= 7 else "🟢"
+        titular = p["titular"][:28]
+        numero = p["numero"]
+        imp = p["importe"]
+        cli = p["cliente"]
+        venc = p["vencimiento"]
+        cuit = p["cuit"]
+        linea = (f"{emoji} *{titular}* | {tipo} Nro:{numero} | "
+                 f"${imp:,.0f} | {cli} | Vence:{venc}({dias_venc}d) | CUIT:{cuit}")
+        lineas.append(linea)
+    await msg.edit_text("\n".join(lineas), parse_mode="Markdown")
+
+
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
@@ -413,6 +596,8 @@ def main():
     app.add_handler(CommandHandler("nuevo", nuevo))
     app.add_handler(CommandHandler("vencer", vencer))
     app.add_handler(CommandHandler("cartera", cartera_cmd))
+    app.add_handler(CommandHandler("cheques", cheques_cmd))
+    app.add_handler(CommandHandler("hoy", cheques_hoy_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     print("🚀 BAI Group Bot iniciado...")
