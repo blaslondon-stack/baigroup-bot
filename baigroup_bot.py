@@ -602,12 +602,14 @@ async def semana_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hoy = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     limite = hoy + timedelta(days=7)
 
-    # Solo cheques SIN destinatario que vencen esta semana — pendientes de depositar
+    # Cheques SIN destinatario cuya FECHA DE HABILITACIÓN (col B) cae esta semana
+    # Es decir: se habilitan para depositar entre hoy y los próximos 7 días
     proximos = [
         r for r in registros
-        if r["venc_dt"]
-        and hoy <= r["venc_dt"] <= limite
-        and not r["destinatario"]
+        if not r["destinatario"]
+        and r["venc_dt"] and r["venc_dt"] >= hoy  # no vencidos
+        and r["fecha_dt"]
+        and hoy <= r["fecha_dt"] <= limite  # se habilitan esta semana
     ]
 
     if not proximos:
@@ -635,7 +637,7 @@ async def semana_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_fisicos = sum(p["importe"] for p in fisicos)
     total = total_echeq + total_fisicos
 
-    lineas = [f"📅 *PENDIENTES ESTA SEMANA — {len(proximos)} cheques*\n"]
+    lineas = [f"📅 *SE HABILITAN ESTA SEMANA — {len(proximos)} cheques*\n"]
     lineas.append(f"💰 Total pendiente: *${total:,.0f}*\n")
 
     if echeq:
