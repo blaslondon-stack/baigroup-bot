@@ -5,6 +5,13 @@ import httpx
 import asyncio
 import anthropic
 from datetime import datetime, timedelta, time as dtime
+
+# Playwright para scraping BCRA con cheques rechazados
+try:
+    from playwright.async_api import async_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -231,7 +238,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 Comandos disponibles:
 
-🔍 `/evaluar [CUIT]` — Evaluación crediticia vía BCRA
+🔍 `/evaluar [CUIT]` — Evaluación crediticia vía BCRA API
+🔍 `/evaluar_completo [CUIT]` — Evaluación COMPLETA con cheques rechazados
 💰 `/cotizar [monto] [días] [tna]` — Cotización de cheque
 📋 `/nuevo [CUIT] [monto] [días] [tna]` — Registrar operación
 📊 `/cheques` — Pendientes sin destinatario (Google Sheets)
@@ -830,6 +838,190 @@ async def alerta_matutina(context):
     except Exception as e:
         print(f"Error en alerta matutina: {e}")
 
+
+# ─────────────────────────────────────────────
+# BCRA SCRAPING CON PLAYWRIGHT (cheques rechazados)
+# ─────────────────────────────────────────────
+async def consultar_bcra_completo(cuit: str) -> dict:
+    """
+    Consulta el BCRA web con Playwright para obtener deudas + cheques rechazados.
+    Resuelve el Cloudflare Turnstile automáticamente.
+    """
+    cuit_limpio = re.sub(r"[-\s]", "", cuit)
+    
+    if not PLAYWRIGHT_AVAILABLE:
+        return {"ok": False, "error": "Playwright no disponible"}
+    
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-accelerated-2d-canvas",
+                    "--disable-gpu",
+                    "--window-size=1280,800",
+                ]
+            )
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 800}
+            )
+            page = await context.new_page()
+            
+            # Navegar al BCRA — Cloudflare se resuelve automáticamente
+            await page.goto(
+                f"https://www.bcra.gob.ar/deudores/?cuit={cuit_limpio}",
+                wait_until="networkidle",
+                timeout=30000
+            )
+            
+            # Esperar a que cargue el contenido
+            await page.wait_for_timeout(3000)
+            
+            # Extraer el texto completo de la página
+            texto = await page.inner_text("body")
+            
+            # También capturar la URL final (tiene el token)
+            url_final = page.url
+            
+            await browser.close()
+            
+            return {
+                "ok": True,
+                "texto": texto,
+                "url": url_final,
+                "cuit": cuit_limpio
+            }
+    except Exception as e:
+        return {"ok": False, "error": f"Error Playwright: {str(e)}"}
+
+async def analizar_bcra_completo_con_claude(cuit: str, texto_bcra: str) -> str:
+    """Analiza el texto completo del BCRA incluyendo cheques rechazados"""
+    if not ANTHROPIC_API_KEY:
+        return analizar_texto_bcra_basico(cuit, texto_bcra)
+    
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        
+        prompt = f"""Sos el agente de crédito de BAI Group SA, financiera especializada en descuento de cheques.
+
+Analizá el siguiente texto extraído de la web del BCRA para el CUIT {cuit}.
+El texto incluye: situación crediticia, historial 24 meses Y cheques rechazados.
+
+TEXTO DEL BCRA:
+{texto_bcra[:8000]}
+
+POLÍTICA CREDITICIA BAI GROUP:
+- Situación 1 sin alertas → APROBAR
+- Situación 1 con alertas históricas → APROBAR CON CONDICIONES  
+- Situación 2 → APROBAR CON CONDICIONES (tasa mayor)
+- Situación 3 o superior → RECHAZAR
+- Cheques rechazados SIN FONDOS en últimos 6 meses → RECHAZAR
+- Cheques rechazados pagados → Analizar con cuidado
+
+Respondé con este formato:
+
+🏢 *LIBRADOR:* [nombre]
+🔢 *CUIT:* {cuit}
+
+📊 *SITUACIÓN BCRA:*
+[Lista entidades con situación y monto]
+
+🚨 *CHEQUES RECHAZADOS:*
+[Cantidad, montos, causales, si están pagados o no]
+[Si no hay: "Sin cheques rechazados ✅"]
+
+📋 *ALERTAS:*
+[Alertas detectadas o "Sin alertas"]
+
+🎯 *RECOMENDACIÓN:*
+[✅ APROBAR / 🟡 APROBAR CON CONDICIONES / ❌ RECHAZAR]
+[Justificación en 2-3 líneas]"""
+
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1500,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.content[0].text
+    except Exception as e:
+        return analizar_texto_bcra_basico(cuit, texto_bcra)
+
+def analizar_texto_bcra_basico(cuit: str, texto: str) -> str:
+    """Análisis básico del texto del BCRA sin Claude"""
+    import re
+    
+    # Extraer nombre
+    nombre_match = re.search(r'Central de Deudores.*?\n([A-ZÁÉÍÓÚÑ][\w\s\.]+?)\n', texto)
+    nombre = nombre_match.group(1).strip() if nombre_match else "Desconocido"
+    
+    # Detectar situaciones
+    sits = re.findall(r'Situación\s*(\d)', texto)
+    max_sit = max([int(s) for s in sits], default=1) if sits else 1
+    
+    # Detectar cheques rechazados
+    cheques_match = re.search(r'Total cheques rechazados\s+([\d,\.]+)\s+([\d,\.]+)', texto)
+    n_cheques = cheques_match.group(1) if cheques_match else "0"
+    monto_cheques = cheques_match.group(2) if cheques_match else "0"
+    
+    sin_fondos = "SIN FONDOS" in texto
+    
+    # Semáforo
+    if sin_fondos or max_sit >= 3:
+        semaforo = "❌ RECHAZAR"
+    elif max_sit == 2:
+        semaforo = "🟡 APROBAR CON CONDICIONES"
+    else:
+        semaforo = "✅ APROBAR"
+    
+    cheques_txt = f"{n_cheques} cheques por ${monto_cheques}" if n_cheques != "0" else "Sin cheques rechazados ✅"
+    
+    return f"""🏢 *LIBRADOR:* {nombre}
+🔢 *CUIT:* {cuit}
+
+📊 *SITUACIÓN BCRA:* Máxima Sit. {max_sit}
+
+🚨 *CHEQUES RECHAZADOS:* {cheques_txt}
+
+🎯 *RECOMENDACIÓN:*
+{semaforo}"""
+
+async def evaluar_completo(update, context):
+    """Evaluación completa con cheques rechazados via Playwright"""
+    if not await check_acceso(update): return
+    
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Usá: `/evaluar_completo [CUIT]`\nEj: `/evaluar_completo 30718462440`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    cuit = re.sub(r"[-\s]", "", context.args[0])
+    msg = await update.message.reply_text(
+        f"🔍 Consultando BCRA completo para CUIT `{cuit}`...\n_(incluye cheques rechazados — puede tardar 10-15 seg)_",
+        parse_mode="Markdown"
+    )
+    
+    resultado = await consultar_bcra_completo(cuit)
+    
+    if not resultado["ok"]:
+        # Fallback a la API normal
+        await msg.edit_text(f"⚠️ Playwright no disponible: {resultado['error']}\nUsando API básica...", parse_mode="Markdown")
+        bcra = await consultar_bcra(cuit)
+        cheques = await consultar_cheques_rechazados(cuit)
+        if bcra["ok"]:
+            analisis = await analizar_con_claude(cuit, bcra["data"], cheques)
+            await msg.edit_text(analisis, parse_mode="Markdown")
+        return
+    
+    await msg.edit_text("🤖 Analizando con IA...", parse_mode="Markdown")
+    analisis = await analizar_bcra_completo_con_claude(cuit, resultado["texto"])
+    await msg.edit_text(analisis, parse_mode="Markdown")
+
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
@@ -846,6 +1038,7 @@ def main():
     app.add_handler(CommandHandler("cheques", cheques_cmd))
     app.add_handler(CommandHandler("semana", semana_cmd))
     app.add_handler(CommandHandler("manana", manana_cmd))
+    app.add_handler(CommandHandler("evaluar_completo", evaluar_completo))
 
     # Alerta matutina automática a las 8:00hs (UTC-3 = 11:00 UTC)
     app.job_queue.run_daily(
