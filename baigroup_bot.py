@@ -293,12 +293,15 @@ async def evaluar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Usá: `/evaluar [CUIT]`\nEj: `/evaluar 30578639868`", parse_mode="Markdown")
         return
 
-    cuit = context.args[0]
+    cuit = re.sub(r"[-\s]", "", context.args[0])
     msg = await update.message.reply_text(f"🔍 Consultando BCRA para CUIT `{cuit}`...", parse_mode="Markdown")
 
-    # Consultar BCRA
-    bcra = await consultar_bcra(cuit)
-    cheques = await consultar_cheques_rechazados(cuit)
+    # Consultar BCRA y cartera simultáneamente
+    bcra, cheques, registros = await asyncio.gather(
+        consultar_bcra(cuit),
+        consultar_cheques_rechazados(cuit),
+        leer_cheques_sheet()
+    )
 
     if not bcra["ok"]:
         await msg.edit_text(f"⚠️ *BCRA:* {bcra['error']}\n\nEl CUIT puede no tener deuda registrada en el sistema financiero.", parse_mode="Markdown")
@@ -308,6 +311,35 @@ async def evaluar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Analizar
     analisis = await analizar_con_claude(cuit, bcra["data"], cheques)
+
+    # Verificar en cartera del Sheet
+    hoy = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    en_cartera = [
+        r for r in registros
+        if r.get("cuit", "").strip() == cuit
+        and r.get("venc_dt") and r["venc_dt"] >= hoy
+        and not r.get("destinatario")
+    ]
+
+    if en_cartera:
+        total_cartera_cuit = sum(r["importe"] for r in en_cartera)
+        total_cartera_general = sum(
+            r["importe"] for r in registros
+            if r.get("venc_dt") and r["venc_dt"] >= hoy
+            and not r.get("destinatario")
+        )
+        pct = (total_cartera_cuit / total_cartera_general * 100) if total_cartera_general > 0 else 0
+        alerta_conc = "🔴 *ALERTA CONCENTRACIÓN*" if pct > 20 else ("⚠️ *Concentración moderada*" if pct > 10 else "")
+
+        cartera_txt = (
+            f"\n\n📋 *EN CARTERA ACTIVA:*\n"
+            f"• {len(en_cartera)} cheques sin depositar — *${total_cartera_cuit:,.0f}*\n"
+            f"• Representa el *{pct:.1f}%* de la cartera total"
+        )
+        if alerta_conc:
+            cartera_txt += f"\n• {alerta_conc}"
+
+        analisis += cartera_txt
 
     await msg.edit_text(analisis, parse_mode="Markdown")
 
