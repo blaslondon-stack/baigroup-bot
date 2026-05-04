@@ -452,10 +452,13 @@ async def leer_cheques_sheet() -> list:
             cols = parse_csv_line(line)
             if len(cols) < 10:
                 continue
-            titular = cols[4].strip()
-            importe_str = cols[6].strip()
-            if not titular or not importe_str:
+            titular = cols[4].strip() if len(cols) > 4 else ""
+            importe_str = cols[6].strip() if len(cols) > 6 else ""
+            if not importe_str:
                 continue
+            # Si no hay titular, usar el número de cheque o "Sin identificar"
+            if not titular:
+                titular = f"Nro {cols[3].strip()}" if len(cols) > 3 and cols[3].strip() else "Sin identificar"
             
             registros.append({
                 "tipo": cols[0].strip(),          # ECHEQ / vacío
