@@ -602,12 +602,12 @@ async def semana_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hoy = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     limite = hoy + timedelta(days=7)
 
-    # Cheques que vencen en los próximos 7 días Y ya tienen destinatario (ya depositados, se acreditan)
-    # O sin destinatario pero con fecha disponible (pendientes de depositar esta semana)
+    # Solo cheques SIN destinatario que vencen esta semana — pendientes de depositar
     proximos = [
         r for r in registros
         if r["venc_dt"]
         and hoy <= r["venc_dt"] <= limite
+        and not r["destinatario"]
     ]
 
     if not proximos:
@@ -623,11 +623,11 @@ async def semana_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Separar por estado (depositado vs pendiente)
     def formato_cheque(p):
         dias = (p["venc_dt"] - hoy).days
-        estado_ico = "✅" if p["destinatario"] else "⚠️"
         cuit = p["cuit"]
-        lineas = [f"{estado_ico} *{p['titular'][:28]}* | ${p['importe']:,.0f}"]
+        titular = p["titular"][:28]
+        lineas = [f"⚠️ *{titular}* | ${p['importe']:,.0f}"]
         lineas.append(f"   📅 Vence: {p['vencimiento']} ({dias}d) | Cliente: {p['cliente'][:20]}")
-        if not p["destinatario"] and cuit:
+        if cuit:
             lineas.append(f"   👉 /evaluar {cuit}")
         return "\n".join(lineas)
 
@@ -635,14 +635,8 @@ async def semana_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_fisicos = sum(p["importe"] for p in fisicos)
     total = total_echeq + total_fisicos
 
-    dep_echeq = sum(1 for p in echeq if p["destinatario"])
-    dep_fisicos = sum(1 for p in fisicos if p["destinatario"])
-    pend_echeq = len(echeq) - dep_echeq
-    pend_fisicos = len(fisicos) - dep_fisicos
-
-    lineas = [f"📅 *PRÓXIMOS 7 DÍAS — {len(proximos)} cheques*\n"]
-    lineas.append(f"💰 Total a acreditar: *${total:,.0f}*")
-    lineas.append(f"✅ Ya depositados: {dep_echeq + dep_fisicos} | ⚠️ Pendientes: {pend_echeq + pend_fisicos}\n")
+    lineas = [f"📅 *PENDIENTES ESTA SEMANA — {len(proximos)} cheques*\n"]
+    lineas.append(f"💰 Total pendiente: *${total:,.0f}*\n")
 
     if echeq:
         lineas.append(f"💻 *ECHEQ — {len(echeq)} cheques — ${total_echeq:,.0f}*")
