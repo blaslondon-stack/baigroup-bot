@@ -220,6 +220,7 @@ Comandos disponibles:
 📋 `/nuevo [CUIT] [monto] [días] [tna]` — Registrar operación
 📊 `/cheques` — Pendientes sin destinatario (Google Sheets)
 📅 `/hoy` — Disponibles para depositar hoy
+📅 `/semana` — Cheques que vencen esta semana (ECHEQ vs físico)
 ⏰ `/vencer` — Próximos a vencer en cartera interna
 📈 `/cartera` — Resumen cartera interna
 
@@ -585,6 +586,83 @@ async def cheques_hoy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text("\n".join(lineas), parse_mode="Markdown")
 
 
+
+async def semana_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra cheques que se acreditan en los próximos 7 días, separados por tipo"""
+    msg = await update.message.reply_text("📅 Consultando próximos 7 días...", parse_mode="Markdown")
+
+    registros = await leer_cheques_sheet()
+    if not registros:
+        await msg.edit_text("❌ No se pudo leer la planilla.", parse_mode="Markdown")
+        return
+
+    hoy = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    limite = hoy + timedelta(days=7)
+
+    # Cheques que vencen en los próximos 7 días Y ya tienen destinatario (ya depositados, se acreditan)
+    # O sin destinatario pero con fecha disponible (pendientes de depositar esta semana)
+    proximos = [
+        r for r in registros
+        if r["venc_dt"]
+        and hoy <= r["venc_dt"] <= limite
+    ]
+
+    if not proximos:
+        await msg.edit_text("✅ No hay cheques venciendo en los próximos 7 días.", parse_mode="Markdown")
+        return
+
+    proximos.sort(key=lambda x: x["venc_dt"])
+
+    # Separar por tipo
+    echeq = [p for p in proximos if p["tipo"] == "ECHEQ"]
+    fisicos = [p for p in proximos if p["tipo"] != "ECHEQ"]
+
+    # Separar por estado (depositado vs pendiente)
+    def formato_cheque(p):
+        dias = (p["venc_dt"] - hoy).days
+        estado_ico = "✅" if p["destinatario"] else "⚠️"
+        cuit = p["cuit"]
+        lineas = [f"{estado_ico} *{p['titular'][:28]}* | ${p['importe']:,.0f}"]
+        lineas.append(f"   📅 Vence: {p['vencimiento']} ({dias}d) | Cliente: {p['cliente'][:20]}")
+        if not p["destinatario"] and cuit:
+            lineas.append(f"   👉 /evaluar {cuit}")
+        return "\n".join(lineas)
+
+    total_echeq = sum(p["importe"] for p in echeq)
+    total_fisicos = sum(p["importe"] for p in fisicos)
+    total = total_echeq + total_fisicos
+
+    dep_echeq = sum(1 for p in echeq if p["destinatario"])
+    dep_fisicos = sum(1 for p in fisicos if p["destinatario"])
+    pend_echeq = len(echeq) - dep_echeq
+    pend_fisicos = len(fisicos) - dep_fisicos
+
+    lineas = [f"📅 *PRÓXIMOS 7 DÍAS — {len(proximos)} cheques*\n"]
+    lineas.append(f"💰 Total a acreditar: *${total:,.0f}*")
+    lineas.append(f"✅ Ya depositados: {dep_echeq + dep_fisicos} | ⚠️ Pendientes: {pend_echeq + pend_fisicos}\n")
+
+    if echeq:
+        lineas.append(f"💻 *ECHEQ — {len(echeq)} cheques — ${total_echeq:,.0f}*")
+        lineas.append(f"_(acreditación automática al vencimiento)_\n")
+        for p in echeq:
+            lineas.append(formato_cheque(p))
+            lineas.append("")
+
+    if fisicos:
+        lineas.append(f"📄 *FÍSICOS — {len(fisicos)} cheques — ${total_fisicos:,.0f}*")
+        lineas.append(f"_(requieren depósito manual en banco)_\n")
+        for p in fisicos:
+            lineas.append(formato_cheque(p))
+            lineas.append("")
+
+    # Dividir en mensajes si es muy largo
+    texto = "\n".join(lineas)
+    if len(texto) > 4000:
+        await msg.edit_text(texto[:4000], parse_mode="Markdown")
+        await update.message.reply_text(texto[4000:], parse_mode="Markdown")
+    else:
+        await msg.edit_text(texto, parse_mode="Markdown")
+
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
@@ -599,6 +677,7 @@ def main():
     app.add_handler(CommandHandler("vencer", vencer))
     app.add_handler(CommandHandler("cartera", cartera_cmd))
     app.add_handler(CommandHandler("cheques", cheques_cmd))
+    app.add_handler(CommandHandler("semana", semana_cmd))
     app.add_handler(CommandHandler("hoy", cheques_hoy_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
