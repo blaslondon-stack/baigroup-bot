@@ -120,7 +120,7 @@ Respondé en este formato exacto con emojis:
 [Si aplica, qué condiciones poner]"""
 
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=1000,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -192,10 +192,12 @@ def analizar_sin_claude(cuit: str, bcra_data: dict, cheques_data: dict) -> str:
 # CALCULAR DESCUENTO
 # ─────────────────────────────────────────────
 def calcular_descuento(monto: float, dias: int, tna: float) -> dict:
-    tasa_periodo = (tna / 100) * (dias / 365)
+    tasa_periodo = (tna / 100) * (dias / 360)
     interes = monto * tasa_periodo
     neto = monto - interes
-    cft = tasa_periodo * (365 / dias) * 100
+    # CFT = tasa efectiva anual compuesta base 360
+    tea = ((1 + tasa_periodo) ** (360 / dias) - 1) * 100
+    cft = round(tea, 2)
     return {
         "monto_nominal": monto,
         "dias": dias,
@@ -264,7 +266,15 @@ async def cotizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        monto = float(context.args[0].replace(",", "").replace(".", ""))
+        # Acepta: 10000000 / 10.000.000 / $10.000.000
+        raw = context.args[0].replace("$", "").strip()
+        if raw.count(".") > 1:
+            raw = raw.replace(".", "")
+        elif "," in raw and "." not in raw and len(raw.split(",")[-1]) == 3:
+            raw = raw.replace(",", "")
+        elif "," in raw and "." not in raw:
+            raw = raw.replace(",", ".")
+        monto = float(raw)
         dias = int(context.args[1])
         tna = float(context.args[2])
 
@@ -279,7 +289,8 @@ async def cotizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ━━━━━━━━━━━━━━━
 💸 *Interés a descontar:* ${r['interes']:,.2f}
 ✅ *Neto a acreditar:* ${r['neto_a_acreditar']:,.2f}
-📊 *CFT anual:* {r['cft_anual']}%
+📊 *CFT (TEA):* {r['cft_anual']}%
+📅 *Tasa mensual equiv.:* {round((tna/100)*(30/360)*100, 2)}%
 ━━━━━━━━━━━━━━━
 
 _Vence en {dias} días — {(datetime.now() + timedelta(days=dias)).strftime('%d/%m/%Y')}_"""
