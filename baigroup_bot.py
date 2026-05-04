@@ -4,7 +4,7 @@ import json
 import httpx
 import asyncio
 import anthropic
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -236,7 +236,8 @@ Comandos disponibles:
 📋 `/nuevo [CUIT] [monto] [días] [tna]` — Registrar operación
 📊 `/cheques` — Pendientes sin destinatario (Google Sheets)
 📅 `/hoy` — Disponibles para depositar hoy
-📅 `/semana` — Cheques que vencen esta semana (ECHEQ vs físico)
+📅 `/semana` — Se habilitan esta semana (ECHEQ vs físico)
+📅 `/manana` — Cheques que se habilitan mañana
 ⏰ `/vencer` — Próximos a vencer en cartera interna
 📈 `/cartera` — Resumen cartera interna
 
@@ -686,6 +687,149 @@ async def semana_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await msg.edit_text(texto, parse_mode="Markdown")
 
+
+# ─────────────────────────────────────────────
+# COMANDO /MAÑANA
+# ─────────────────────────────────────────────
+async def manana_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cheques que se habilitan mañana para depositar"""
+    if not await check_acceso(update): return
+    msg = await update.message.reply_text("📅 Consultando cheques de mañana...", parse_mode="Markdown")
+
+    registros = await leer_cheques_sheet()
+    if not registros:
+        await msg.edit_text("❌ No se pudo leer la planilla.", parse_mode="Markdown")
+        return
+
+    hoy = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    manana = hoy + timedelta(days=1)
+
+    disponibles = [
+        r for r in registros
+        if not r["destinatario"]
+        and r["fecha_dt"] and r["fecha_dt"].date() == manana.date()
+        and r["venc_dt"] and r["venc_dt"] >= hoy
+    ]
+
+    if not disponibles:
+        await msg.edit_text(f"✅ No hay cheques que se habiliten mañana ({manana.strftime('%d/%m/%Y')}).", parse_mode="Markdown")
+        return
+
+    disponibles.sort(key=lambda x: x["venc_dt"])
+    total = sum(p["importe"] for p in disponibles)
+
+    echeq = [p for p in disponibles if p["tipo"] == "ECHEQ"]
+    fisicos = [p for p in disponibles if p["tipo"] != "ECHEQ"]
+
+    lineas = [f"📅 *MAÑANA {manana.strftime('%d/%m/%Y')} — {len(disponibles)} cheques*\n"]
+    lineas.append(f"💰 Total: *${total:,.0f}*\n")
+
+    if echeq:
+        lineas.append(f"💻 *ECHEQ — {len(echeq)} cheques — ${sum(p['importe'] for p in echeq):,.0f}*")
+        for p in echeq:
+            dias_venc = (p["venc_dt"] - hoy).days
+            cuit = p["cuit"]
+            lineas.append(f"• *{p['titular'][:28]}* | ${p['importe']:,.0f} | Vence: {p['vencimiento']} ({dias_venc}d) | {p['cliente']}")
+            if cuit:
+                lineas.append(f"  👉 /evaluar {cuit}")
+
+    if fisicos:
+        lineas.append(f"\n📄 *FÍSICOS — {len(fisicos)} cheques — ${sum(p['importe'] for p in fisicos):,.0f}*")
+        for p in fisicos:
+            dias_venc = (p["venc_dt"] - hoy).days
+            cuit = p["cuit"]
+            lineas.append(f"• *{p['titular'][:28]}* | ${p['importe']:,.0f} | Vence: {p['vencimiento']} ({dias_venc}d) | {p['cliente']}")
+            if cuit:
+                lineas.append(f"  👉 /evaluar {cuit}")
+
+    await msg.edit_text("\n".join(lineas), parse_mode="Markdown")
+
+# ─────────────────────────────────────────────
+# ALERTA MATUTINA AUTOMÁTICA
+# ─────────────────────────────────────────────
+async def alerta_matutina(context):
+    """Se ejecuta automáticamente cada mañana a las 8hs"""
+    try:
+        registros = await leer_cheques_sheet()
+        if not registros:
+            return
+
+        hoy = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        manana = hoy + timedelta(days=1)
+        semana = hoy + timedelta(days=7)
+
+        # Habilitados hoy
+        hoy_list = [
+            r for r in registros
+            if not r["destinatario"]
+            and r["fecha_dt"] and r["fecha_dt"].date() == hoy.date()
+            and r["venc_dt"] and r["venc_dt"] >= hoy
+        ]
+
+        # Habilitados mañana
+        manana_list = [
+            r for r in registros
+            if not r["destinatario"]
+            and r["fecha_dt"] and r["fecha_dt"].date() == manana.date()
+            and r["venc_dt"] and r["venc_dt"] >= hoy
+        ]
+
+        # Vencen esta semana sin destinatario
+        vencen_semana = [
+            r for r in registros
+            if not r["destinatario"]
+            and r["venc_dt"]
+            and hoy <= r["venc_dt"] <= semana
+        ]
+
+        # Total cartera pendiente
+        total_cartera = sum(
+            r["importe"] for r in registros
+            if not r["destinatario"]
+            and r["venc_dt"] and r["venc_dt"] >= hoy
+        )
+
+        # Construir mensaje
+        fecha_hoy = hoy.strftime("%d/%m/%Y")
+        lineas = [f"☀️ *BUENOS DÍAS — {fecha_hoy}*\n"]
+
+        if hoy_list:
+            total_hoy = sum(p["importe"] for p in hoy_list)
+            lineas.append(f"🟢 *HOY disponibles para depositar:* {len(hoy_list)} cheques — ${total_hoy:,.0f}")
+            for p in hoy_list[:5]:
+                lineas.append(f"   • {p['titular'][:25]} | ${p['importe']:,.0f} | {p['cliente']}")
+            if len(hoy_list) > 5:
+                lineas.append(f"   _...y {len(hoy_list)-5} más. Usá /hoy para ver todos._")
+        else:
+            lineas.append("🟢 *HOY:* No hay cheques para depositar")
+
+        if manana_list:
+            total_manana = sum(p["importe"] for p in manana_list)
+            lineas.append(f"\n📅 *MAÑANA se habilitan:* {len(manana_list)} cheques — ${total_manana:,.0f}")
+        else:
+            lineas.append("\n📅 *MAÑANA:* Sin cheques nuevos")
+
+        if vencen_semana:
+            total_vencen = sum(p["importe"] for p in vencen_semana)
+            urgentes = [p for p in vencen_semana if (p["venc_dt"] - hoy).days <= 2]
+            lineas.append(f"\n⚠️ *Vencen esta semana sin depositar:* {len(vencen_semana)} — ${total_vencen:,.0f}")
+            if urgentes:
+                lineas.append(f"🔴 *URGENTE ({len(urgentes)} vencen en 2 días):*")
+                for p in urgentes:
+                    dias = (p["venc_dt"] - hoy).days
+                    lineas.append(f"   • {p['titular'][:25]} | ${p['importe']:,.0f} | Vence en {dias}d")
+
+        lineas.append(f"\n💰 *Cartera total pendiente:* ${total_cartera:,.0f}")
+        lineas.append("\n_Usá /hoy, /semana o /cheques para más detalle._")
+
+        await context.bot.send_message(
+            chat_id=GRUPO_PERMITIDO,
+            text="\n".join(lineas),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        print(f"Error en alerta matutina: {e}")
+
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
@@ -701,6 +845,14 @@ def main():
     app.add_handler(CommandHandler("cartera", cartera_cmd))
     app.add_handler(CommandHandler("cheques", cheques_cmd))
     app.add_handler(CommandHandler("semana", semana_cmd))
+    app.add_handler(CommandHandler("manana", manana_cmd))
+
+    # Alerta matutina automática a las 8:00hs (UTC-3 = 11:00 UTC)
+    app.job_queue.run_daily(
+        alerta_matutina,
+        time=dtime(hour=11, minute=0, second=0),  # 8hs Argentina (UTC-3)
+        days=(0, 1, 2, 3, 4, 5, 6)  # todos los días
+    )
     app.add_handler(CommandHandler("hoy", cheques_hoy_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
