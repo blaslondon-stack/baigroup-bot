@@ -1111,6 +1111,83 @@ async def evaluar_completo(update, context):
     analisis = await analizar_bcra_completo_con_claude(cuit, resultado["texto"])
     await msg.edit_text(analisis, parse_mode="Markdown")
 
+
+# ─────────────────────────────────────────────
+# COMANDO /DOLAR
+# ─────────────────────────────────────────────
+async def dolar_cmd(update, context):
+    """Cotizaciones del dólar desde DolarApi y DolarHoy"""
+    if not await check_acceso(update): return
+    msg = await update.message.reply_text("💵 Consultando cotizaciones...", parse_mode="Markdown")
+
+    async with httpx.AsyncClient(timeout=10, verify=False, follow_redirects=True) as client:
+        try:
+            r1 = await client.get("https://dolarapi.com/v1/dolares")
+            dolarapi = r1.json() if r1.status_code == 200 else []
+        except:
+            dolarapi = []
+
+        try:
+            r2 = await client.get("https://dolarhoy.com/i/cotizaciones/dolar-blue")
+            dolarhoy_blue = r2.json() if r2.status_code == 200 else {}
+        except:
+            dolarhoy_blue = {}
+
+        try:
+            r3 = await client.get("https://dolarhoy.com/i/cotizaciones/dolar-oficial")
+            dolarhoy_oficial = r3.json() if r3.status_code == 200 else {}
+        except:
+            dolarhoy_oficial = {}
+
+    # Parsear DolarApi
+    tipos = {}
+    for item in dolarapi:
+        casa = item.get("casa", "").lower()
+        tipos[casa] = item
+
+    # Construir respuesta
+    ahora = datetime.now().strftime("%d/%m/%Y %H:%M")
+    lineas = [f"💵 *COTIZACIONES USD — {ahora}hs*\n"]
+
+    # Fuente 1: DolarApi
+    lineas.append("📊 *DolarApi.com:*")
+
+    nombres = [
+        ("oficial", "🏦 Oficial"),
+        ("blue", "🔵 Blue"),
+        ("bolsa", "📈 MEP"),
+        ("contadoconliqui", "💹 CCL"),
+        ("mayorista", "🌾 Mayorista"),
+        ("cripto", "🔐 Cripto"),
+    ]
+
+    for clave, nombre in nombres:
+        if clave in tipos:
+            compra = tipos[clave].get("compra", "-")
+            venta = tipos[clave].get("venta", "-")
+            lineas.append(f"  {nombre}: ${compra} / ${venta}")
+
+    # Fuente 2: DolarHoy
+    lineas.append("\n📊 *DolarHoy.com:*")
+
+    if dolarhoy_blue:
+        compra = dolarhoy_blue.get("compra", {}).get("value", "-")
+        venta = dolarhoy_blue.get("venta", {}).get("value", "-")
+        lineas.append(f"  🔵 Blue: {compra} / {venta}")
+    else:
+        lineas.append("  🔵 Blue: no disponible")
+
+    if dolarhoy_oficial:
+        compra = dolarhoy_oficial.get("compra", {}).get("value", "-")
+        venta = dolarhoy_oficial.get("venta", {}).get("value", "-")
+        lineas.append(f"  🏦 Oficial: {compra} / {venta}")
+    else:
+        lineas.append("  🏦 Oficial: no disponible")
+
+    lineas.append("\n_Formato: compra / venta_")
+
+    await msg.edit_text("\n".join(lineas), parse_mode="Markdown")
+
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
@@ -1128,6 +1205,7 @@ def main():
     app.add_handler(CommandHandler("semana", semana_cmd))
     app.add_handler(CommandHandler("manana", manana_cmd))
     app.add_handler(CommandHandler("evaluar_completo", evaluar_completo))
+    app.add_handler(CommandHandler("dolar", dolar_cmd))
 
     # Alerta matutina automática a las 8:00hs (UTC-3 = 11:00 UTC)
     app.job_queue.run_daily(
