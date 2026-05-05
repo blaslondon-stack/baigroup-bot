@@ -18,7 +18,6 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 # TOKENS
 TELEGRAM_TOKEN = "8764473072:AAG1v2uRuyNFaxxW9gl_xddwZNS2cx4Bvwc"
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-ESTADISTICAS_BCRA_TOKEN = os.environ.get("ESTADISTICAS_BCRA_TOKEN", "")
 
 # SEGURIDAD — solo responde en este grupo y a este usuario
 GRUPO_PERMITIDO = -5265832156
@@ -1178,77 +1177,6 @@ async def dolar_cmd(update, context):
 
 
 # ─────────────────────────────────────────────
-# COMANDO /MACRO — INDICADORES BCRA
-# ─────────────────────────────────────────────
-async def macro_cmd(update, context):
-    """Indicadores macroeconómicos: reservas, inflación, Merval, USD"""
-    if not await check_acceso(update): return
-    msg = await update.message.reply_text("📊 Consultando indicadores macro...", parse_mode="Markdown")
-
-    token = ESTADISTICAS_BCRA_TOKEN
-    if not token:
-        await msg.edit_text("❌ Token de estadisticasbcra.com no configurado.", parse_mode="Markdown")
-        return
-
-    headers = {"Authorization": f"BEARER {token}"}
-    
-    async with httpx.AsyncClient(timeout=15, verify=False, follow_redirects=True) as client:
-        resultados = {}
-        endpoints = {
-            "reservas": "/reservas",
-            "usd_blue": "/usd",
-            "usd_oficial": "/usd_of",
-            "inflacion": "/inflacion",
-            "merval": "/merval",
-            "leliq": "/leliq",
-        }
-        for key, path in endpoints.items():
-            try:
-                r = await client.get(f"https://api.estadisticasbcra.com{path}", headers=headers)
-                if r.status_code == 200:
-                    data = r.json()
-                    # Tomar el último valor
-                    if data:
-                        ultimo = data[-1]
-                        resultados[key] = {"fecha": ultimo.get("d", ""), "valor": ultimo.get("v", 0)}
-            except:
-                pass
-
-    if not resultados:
-        await msg.edit_text("❌ No se pudieron obtener los datos macro.", parse_mode="Markdown")
-        return
-
-    ahora = datetime.now().strftime("%d/%m/%Y")
-    lineas = [f"📊 *INDICADORES MACRO — {ahora}*\n"]
-
-    if "reservas" in resultados:
-        r = resultados["reservas"]
-        lineas.append(f"🏦 *Reservas BCRA:* USD {r['valor']:,.0f}M ({r['fecha']})")
-
-    if "usd_blue" in resultados and "usd_oficial" in resultados:
-        blue = resultados["usd_blue"]["valor"]
-        oficial = resultados["usd_oficial"]["valor"]
-        brecha = ((blue - oficial) / oficial * 100) if oficial > 0 else 0
-        lineas.append(f"💵 *USD Blue:* ${blue:,.0f} | *Oficial:* ${oficial:,.0f}")
-        lineas.append(f"📏 *Brecha:* {brecha:.1f}%")
-
-    if "inflacion" in resultados:
-        inf = resultados["inflacion"]
-        lineas.append(f"📈 *Inflación mensual:* {inf['valor']:.1f}% ({inf['fecha']})")
-
-    if "merval" in resultados:
-        merv = resultados["merval"]
-        lineas.append(f"📉 *Merval:* {merv['valor']:,.0f} pts ({merv['fecha']})")
-
-    if "leliq" in resultados:
-        lel = resultados["leliq"]
-        lineas.append(f"💰 *LELIQ/Pases:* {lel['valor']:.2f}% TNA ({lel['fecha']})")
-
-    lineas.append("\n_Fuente: estadisticasbcra.com_")
-
-    await msg.edit_text("\n".join(lineas), parse_mode="Markdown")
-
-# ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
 def main():
@@ -1266,7 +1194,6 @@ def main():
     app.add_handler(CommandHandler("manana", manana_cmd))
     app.add_handler(CommandHandler("evaluar_completo", evaluar_completo))
     app.add_handler(CommandHandler("dolar", dolar_cmd))
-    app.add_handler(CommandHandler("macro", macro_cmd))
 
     # Alerta matutina automática a las 8:00hs (UTC-3 = 11:00 UTC)
     app.job_queue.run_daily(
