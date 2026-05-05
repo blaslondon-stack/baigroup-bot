@@ -18,6 +18,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 # TOKENS
 TELEGRAM_TOKEN = "8764473072:AAG1v2uRuyNFaxxW9gl_xddwZNS2cx4Bvwc"
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+ESTADISTICAS_BCRA_TOKEN = os.environ.get("ESTADISTICAS_BCRA_TOKEN", "")
 
 # SEGURIDAD — solo responde en este grupo y a este usuario
 GRUPO_PERMITIDO = -5265832156
@@ -48,15 +49,12 @@ async def consultar_bcra(cuit: str) -> dict:
         "Accept": "application/json",
         "Accept-Language": "es-AR,es;q=0.9",
     }
-    # Intentar hasta 3 veces con delay creciente entre intentos
-    delays = [0, 5, 10]  # esperar 0s, 5s, 10s antes de cada intento
+    # Intentar 2 veces — inmediato + 1 reintento rápido
     ultimo_error = ""
-    for intento in range(3):
-        if delays[intento] > 0:
-            await asyncio.sleep(delays[intento])
+    for intento in range(2):
         try:
             async with httpx.AsyncClient(
-                timeout=httpx.Timeout(20.0, connect=8.0),
+                timeout=httpx.Timeout(10.0, connect=5.0),
                 verify=False,
                 follow_redirects=True
             ) as client:
@@ -65,14 +63,13 @@ async def consultar_bcra(cuit: str) -> dict:
                     return {"ok": True, "data": r.json()}
                 elif r.status_code == 404:
                     return {"ok": False, "error": "CUIT sin deuda registrada en Central de Deudores"}
-                elif r.status_code == 401 or r.status_code == 403:
-                    return {"ok": False, "error": f"BCRA bloqueó la consulta (HTTP {r.status_code})"}
                 else:
                     ultimo_error = f"HTTP {r.status_code}"
         except Exception as e:
             ultimo_error = str(e)
-            continue
-    return {"ok": False, "error": f"Sin conexión con BCRA luego de 3 intentos. {ultimo_error}"}
+        if intento == 0:
+            await asyncio.sleep(1)
+    return {"ok": False, "error": f"Sin conexión con BCRA: {ultimo_error}"}
 
 async def consultar_cheques_rechazados(cuit: str) -> dict:
     cuit_limpio = re.sub(r"[-\s]", "", cuit)
@@ -1131,16 +1128,10 @@ async def dolar_cmd(update, context):
             dolarapi = []
 
         try:
-            r2 = await client.get("https://dolarhoy.com/i/cotizaciones/dolar-blue")
-            dolarhoy_blue = r2.json() if r2.status_code == 200 else {}
+            r2 = await client.get("https://api.bluelytics.com.ar/v2/latest")
+            bluelytics = r2.json() if r2.status_code == 200 else {}
         except:
-            dolarhoy_blue = {}
-
-        try:
-            r3 = await client.get("https://dolarhoy.com/i/cotizaciones/dolar-oficial")
-            dolarhoy_oficial = r3.json() if r3.status_code == 200 else {}
-        except:
-            dolarhoy_oficial = {}
+            bluelytics = {}
 
     # Parsear DolarApi
     tipos = {}
@@ -1152,9 +1143,6 @@ async def dolar_cmd(update, context):
     ahora = datetime.now().strftime("%d/%m/%Y %H:%M")
     lineas = [f"💵 *COTIZACIONES USD — {ahora}hs*\n"]
 
-    # Fuente 1: DolarApi
-    lineas.append("📊 *DolarApi.com:*")
-
     nombres = [
         ("oficial", "🏦 Oficial"),
         ("blue", "🔵 Blue"),
@@ -1164,30 +1152,99 @@ async def dolar_cmd(update, context):
         ("cripto", "🔐 Cripto"),
     ]
 
-    for clave, nombre in nombres:
-        if clave in tipos:
-            compra = tipos[clave].get("compra", "-")
-            venta = tipos[clave].get("venta", "-")
-            lineas.append(f"  {nombre}: ${compra} / ${venta}")
-
-    # Fuente 2: DolarHoy
-    lineas.append("\n📊 *DolarHoy.com:*")
-
-    if dolarhoy_blue:
-        compra = dolarhoy_blue.get("compra", {}).get("value", "-")
-        venta = dolarhoy_blue.get("venta", {}).get("value", "-")
-        lineas.append(f"  🔵 Blue: {compra} / {venta}")
+    if tipos:
+        lineas.append("📊 *DolarApi.com:*")
+        for clave, nombre in nombres:
+            if clave in tipos:
+                compra = tipos[clave].get("compra", "-")
+                venta = tipos[clave].get("venta", "-")
+                lineas.append(f"  {nombre}: ${compra} / ${venta}")
     else:
-        lineas.append("  🔵 Blue: no disponible")
+        lineas.append("❌ DolarApi no disponible")
 
-    if dolarhoy_oficial:
-        compra = dolarhoy_oficial.get("compra", {}).get("value", "-")
-        venta = dolarhoy_oficial.get("venta", {}).get("value", "-")
-        lineas.append(f"  🏦 Oficial: {compra} / {venta}")
-    else:
-        lineas.append("  🏦 Oficial: no disponible")
+    # Fuente 2: Bluelytics (reemplaza DolarHoy)
+    if bluelytics:
+        lineas.append("\n📊 *Bluelytics.com.ar:*")
+        oficial = bluelytics.get("oficial", {})
+        blue = bluelytics.get("blue", {})
+        if oficial:
+            lineas.append(f"  🏦 Oficial: ${oficial.get('value_buy', '-')} / ${oficial.get('value_sell', '-')}")
+        if blue:
+            lineas.append(f"  🔵 Blue: ${blue.get('value_buy', '-')} / ${blue.get('value_sell', '-')}")
 
     lineas.append("\n_Formato: compra / venta_")
+
+    await msg.edit_text("\n".join(lineas), parse_mode="Markdown")
+
+
+# ─────────────────────────────────────────────
+# COMANDO /MACRO — INDICADORES BCRA
+# ─────────────────────────────────────────────
+async def macro_cmd(update, context):
+    """Indicadores macroeconómicos: reservas, inflación, Merval, USD"""
+    if not await check_acceso(update): return
+    msg = await update.message.reply_text("📊 Consultando indicadores macro...", parse_mode="Markdown")
+
+    token = ESTADISTICAS_BCRA_TOKEN
+    if not token:
+        await msg.edit_text("❌ Token de estadisticasbcra.com no configurado.", parse_mode="Markdown")
+        return
+
+    headers = {"Authorization": f"BEARER {token}"}
+    
+    async with httpx.AsyncClient(timeout=15, verify=False, follow_redirects=True) as client:
+        resultados = {}
+        endpoints = {
+            "reservas": "/reservas",
+            "usd_blue": "/usd",
+            "usd_oficial": "/usd_of",
+            "inflacion": "/inflacion",
+            "merval": "/merval",
+            "leliq": "/leliq",
+        }
+        for key, path in endpoints.items():
+            try:
+                r = await client.get(f"https://api.estadisticasbcra.com{path}", headers=headers)
+                if r.status_code == 200:
+                    data = r.json()
+                    # Tomar el último valor
+                    if data:
+                        ultimo = data[-1]
+                        resultados[key] = {"fecha": ultimo.get("d", ""), "valor": ultimo.get("v", 0)}
+            except:
+                pass
+
+    if not resultados:
+        await msg.edit_text("❌ No se pudieron obtener los datos macro.", parse_mode="Markdown")
+        return
+
+    ahora = datetime.now().strftime("%d/%m/%Y")
+    lineas = [f"📊 *INDICADORES MACRO — {ahora}*\n"]
+
+    if "reservas" in resultados:
+        r = resultados["reservas"]
+        lineas.append(f"🏦 *Reservas BCRA:* USD {r['valor']:,.0f}M ({r['fecha']})")
+
+    if "usd_blue" in resultados and "usd_oficial" in resultados:
+        blue = resultados["usd_blue"]["valor"]
+        oficial = resultados["usd_oficial"]["valor"]
+        brecha = ((blue - oficial) / oficial * 100) if oficial > 0 else 0
+        lineas.append(f"💵 *USD Blue:* ${blue:,.0f} | *Oficial:* ${oficial:,.0f}")
+        lineas.append(f"📏 *Brecha:* {brecha:.1f}%")
+
+    if "inflacion" in resultados:
+        inf = resultados["inflacion"]
+        lineas.append(f"📈 *Inflación mensual:* {inf['valor']:.1f}% ({inf['fecha']})")
+
+    if "merval" in resultados:
+        merv = resultados["merval"]
+        lineas.append(f"📉 *Merval:* {merv['valor']:,.0f} pts ({merv['fecha']})")
+
+    if "leliq" in resultados:
+        lel = resultados["leliq"]
+        lineas.append(f"💰 *LELIQ/Pases:* {lel['valor']:.2f}% TNA ({lel['fecha']})")
+
+    lineas.append("\n_Fuente: estadisticasbcra.com_")
 
     await msg.edit_text("\n".join(lineas), parse_mode="Markdown")
 
@@ -1209,6 +1266,7 @@ def main():
     app.add_handler(CommandHandler("manana", manana_cmd))
     app.add_handler(CommandHandler("evaluar_completo", evaluar_completo))
     app.add_handler(CommandHandler("dolar", dolar_cmd))
+    app.add_handler(CommandHandler("macro", macro_cmd))
 
     # Alerta matutina automática a las 8:00hs (UTC-3 = 11:00 UTC)
     app.job_queue.run_daily(
