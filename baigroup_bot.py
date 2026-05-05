@@ -150,7 +150,8 @@ CRITERIOS ADICIONALES:
 - Refinanciaciones activas = empresa en dificultades, aumentar tasa o rechazar según monto
 - recategorizacionOblig = el BCRA la forzó a bajar categoría, muy negativo
 - Deuda con 3+ entidades simultáneas = analizar concentración
-- Monto total >$500M (en miles) = exposición alta, exigir mayor tasa
+- Monto total >$500M = exposición alta
+- Mostrar montos en millones (ej: $27,63M) no en miles, exigir mayor tasa
 
 Respondé en este formato:
 
@@ -201,7 +202,12 @@ def analizar_sin_claude(cuit: str, bcra_data: dict, cheques_data: dict) -> str:
                 nombre_entidad = entidad.get("entidad", "")
                 if sit > sit_actual:
                     sit_actual = sit
-                entidades_lineas.append(f"• {nombre_entidad}: Sit. {sit} | ${monto:,}k")
+                monto_m = monto / 1000
+                if monto_m >= 1:
+                    monto_fmt = f"${monto_m:,.2f}M"
+                else:
+                    monto_fmt = f"${monto:,.0f}k"
+                entidades_lineas.append(f"• {nombre_entidad}: Sit. {sit} | {monto_fmt}")
         
         # Cheques rechazados
         cheques = cheques_data.get("cheques", [])
@@ -270,8 +276,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 Comandos disponibles:
 
-🔍 `/evaluar [CUIT]` — Evaluación crediticia vía BCRA API
-🔍 `/evaluar_completo [CUIT]` — Evaluación COMPLETA con cheques rechazados
+🔍 `/evaluar [CUIT]` — Evaluación crediticia vía BCRA
+🔍 `/evaluar_completo [CUIT]` — Evaluación completa con cheques
+📋 `/analizar [texto]` — Pegá texto del BCRA para análisis completo
+🔎 `/buscar [nombre]` — Buscar por cliente o titular en cartera
 💰 `/cotizar [monto] [días] [tna]` — Cotización de cheque
 📋 `/nuevo [CUIT] [monto] [días] [tna]` — Registrar operación
 📊 `/cheques` — Pendientes sin destinatario (Google Sheets)
@@ -721,11 +729,11 @@ async def semana_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Separar por estado (depositado vs pendiente)
     def formato_cheque(p):
-        dias = (p["venc_dt"] - hoy).days
         cuit = p["cuit"]
         titular = p["titular"][:28]
+        dias_venc = (p["venc_dt"] - hoy).days if p.get("venc_dt") else 0
         lineas = [f"⚠️ *{titular}* | ${p['importe']:,.0f}"]
-        lineas.append(f"   📅 Vence: {p['vencimiento']} ({dias}d) | Cliente: {p['cliente'][:20]}")
+        lineas.append(f"   🟢 Disponible: {p['fecha']} | Vence: {p['vencimiento']} ({dias_venc}d) | {p['cliente'][:20]}")
         if cuit:
             lineas.append(f"   👉 /evaluar {cuit}")
         return "\n".join(lineas)
@@ -1176,6 +1184,143 @@ async def dolar_cmd(update, context):
     await msg.edit_text("\n".join(lineas), parse_mode="Markdown")
 
 
+
+# ─────────────────────────────────────────────
+# COMANDO /ANALIZAR — Analiza texto BCRA pegado
+# ─────────────────────────────────────────────
+async def analizar_cmd(update, context):
+    """Analiza texto del BCRA pegado directamente en el chat"""
+    if not await check_acceso(update): return
+
+    if not context.args:
+        await update.message.reply_text(
+            "📋 *Cómo usar /analizar:*\n\n"
+            "Pegá el texto del BCRA después del comando:\n"
+            "`/analizar [texto completo del BCRA]`\n\n"
+            "_Copiá todo el texto de la página del BCRA y pegalo acá._",
+            parse_mode="Markdown"
+        )
+        return
+
+    texto = " ".join(context.args)
+    msg = await update.message.reply_text("🤖 Analizando texto del BCRA...", parse_mode="Markdown")
+
+    if not ANTHROPIC_API_KEY:
+        await msg.edit_text("❌ API de Claude no configurada.", parse_mode="Markdown")
+        return
+
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        prompt = f"""Sos el agente de crédito de BAI Group SA, financiera especializada en descuento de cheques.
+
+Analizá el siguiente texto extraído de la web del BCRA. Puede incluir situación crediticia, historial 24 meses y cheques rechazados.
+
+TEXTO DEL BCRA:
+{texto[:6000]}
+
+SEMÁFORO BAI GROUP:
+✅ APROBAR: Sit 1, sin flags, sin cheques rechazados recientes
+🟡 CON CONDICIONES: Sit 1 con alertas menores o cheques rechazados pagados
+🟠 ALTO RIESGO: Sit 2 o cheques rechazados sin pagar
+❌ RECHAZAR: Sit 3+ / proceso judicial / cheques SIN FONDOS impagas recientes
+
+Respondé en este formato:
+
+🏢 *LIBRADOR:* [nombre]
+🔢 *CUIT:* [cuit]
+
+📊 *SITUACIÓN BCRA:*
+[Cada entidad: nombre | Sit X | $monto en M o k]
+
+🚨 *CHEQUES RECHAZADOS:*
+[Cantidad, monto total, causales, pagados vs impagas, último rechazo]
+[Si no hay: "Sin cheques rechazados ✅"]
+
+⚠️ *HISTORIAL:*
+[Alertas del historial 24 meses o "Sin alertas"]
+
+💰 *EXPOSICIÓN TOTAL:*
+[Suma en $M y cantidad de entidades]
+
+🎯 *RECOMENDACIÓN:*
+[✅ APROBAR / 🟡 CON CONDICIONES / 🟠 ALTO RIESGO / ❌ RECHAZAR]
+[Justificación concreta en 2-3 líneas]"""
+
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1500,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        await msg.edit_text(response.content[0].text, parse_mode="Markdown")
+    except Exception as e:
+        await msg.edit_text(f"❌ Error al analizar: {str(e)}", parse_mode="Markdown")
+
+# ─────────────────────────────────────────────
+# COMANDO /BUSCAR — Busca por cliente o titular
+# ─────────────────────────────────────────────
+async def buscar_cmd(update, context):
+    """Busca cheques por nombre de cliente o titular"""
+    if not await check_acceso(update): return
+
+    if not context.args:
+        await update.message.reply_text(
+            "🔍 Usá: `/buscar [nombre]`\nEj: `/buscar GABUCCI` o `/buscar RUBEN URSINO`",
+            parse_mode="Markdown"
+        )
+        return
+
+    query = " ".join(context.args).upper().strip()
+    msg = await update.message.reply_text(f"🔍 Buscando *{query}*...", parse_mode="Markdown")
+
+    registros = await leer_cheques_sheet()
+    if not registros:
+        await msg.edit_text("❌ No se pudo leer la planilla.", parse_mode="Markdown")
+        return
+
+    hoy = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Buscar en titular y cliente
+    encontrados = [
+        r for r in registros
+        if query in r.get("titular", "").upper()
+        or query in r.get("cliente", "").upper()
+    ]
+
+    if not encontrados:
+        await msg.edit_text(f"❌ No se encontraron resultados para *{query}*.", parse_mode="Markdown")
+        return
+
+    # Separar pendientes y depositados
+    pendientes = [r for r in encontrados if not r.get("destinatario") and r.get("venc_dt") and r["venc_dt"] >= hoy]
+    depositados = [r for r in encontrados if r.get("destinatario")]
+    vencidos = [r for r in encontrados if not r.get("destinatario") and r.get("venc_dt") and r["venc_dt"] < hoy]
+
+    total_pendiente = sum(r["importe"] for r in pendientes)
+    total_depositado = sum(r["importe"] for r in depositados)
+
+    lineas = [f"🔍 *BÚSQUEDA: {query}*\n"]
+    lineas.append(f"📋 Total registros encontrados: {len(encontrados)}")
+    lineas.append(f"⚠️ Pendientes sin depositar: {len(pendientes)} — *${total_pendiente:,.0f}*")
+    lineas.append(f"✅ Depositados: {len(depositados)} — ${total_depositado:,.0f}")
+    if vencidos:
+        total_venc = sum(r["importe"] for r in vencidos)
+        lineas.append(f"🔴 Vencidos sin depositar: {len(vencidos)} — ${total_venc:,.0f}")
+
+    if pendientes:
+        lineas.append(f"\n📋 *PENDIENTES:*")
+        pendientes.sort(key=lambda x: x.get("venc_dt") or hoy)
+        for r in pendientes[:10]:
+            dias = (r["venc_dt"] - hoy).days if r.get("venc_dt") else 0
+            cuit = r.get("cuit", "")
+            tipo = "ECHEQ" if r.get("tipo") == "ECHEQ" else "FÍSICO"
+            lineas.append(f"• {r['titular'][:25]} | {tipo} | ${r['importe']:,.0f} | Vence: {r['vencimiento']} ({dias}d)")
+            if cuit:
+                lineas.append(f"  👉 /evaluar {cuit}")
+        if len(pendientes) > 10:
+            lineas.append(f"_...y {len(pendientes)-10} más_")
+
+    await msg.edit_text("\n".join(lineas), parse_mode="Markdown")
+
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
@@ -1193,6 +1338,8 @@ def main():
     app.add_handler(CommandHandler("semana", semana_cmd))
     app.add_handler(CommandHandler("manana", manana_cmd))
     app.add_handler(CommandHandler("evaluar_completo", evaluar_completo))
+    app.add_handler(CommandHandler("analizar", analizar_cmd))
+    app.add_handler(CommandHandler("buscar", buscar_cmd))
     app.add_handler(CommandHandler("dolar", dolar_cmd))
 
     # Alerta matutina automática a las 8:00hs (UTC-3 = 11:00 UTC)
