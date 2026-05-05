@@ -48,11 +48,15 @@ async def consultar_bcra(cuit: str) -> dict:
         "Accept": "application/json",
         "Accept-Language": "es-AR,es;q=0.9",
     }
-    # Intentar hasta 3 veces
+    # Intentar hasta 3 veces con delay creciente entre intentos
+    delays = [0, 5, 10]  # esperar 0s, 5s, 10s antes de cada intento
+    ultimo_error = ""
     for intento in range(3):
+        if delays[intento] > 0:
+            await asyncio.sleep(delays[intento])
         try:
             async with httpx.AsyncClient(
-                timeout=httpx.Timeout(30.0, connect=10.0),
+                timeout=httpx.Timeout(20.0, connect=8.0),
                 verify=False,
                 follow_redirects=True
             ) as client:
@@ -62,14 +66,13 @@ async def consultar_bcra(cuit: str) -> dict:
                 elif r.status_code == 404:
                     return {"ok": False, "error": "CUIT sin deuda registrada en Central de Deudores"}
                 elif r.status_code == 401 or r.status_code == 403:
-                    return {"ok": False, "error": f"BCRA bloqueó la consulta (HTTP {r.status_code}) — intentá en unos minutos"}
+                    return {"ok": False, "error": f"BCRA bloqueó la consulta (HTTP {r.status_code})"}
                 else:
-                    return {"ok": False, "error": f"Error BCRA HTTP {r.status_code}"}
+                    ultimo_error = f"HTTP {r.status_code}"
         except Exception as e:
-            if intento < 2:
-                await asyncio.sleep(2)
-                continue
-            return {"ok": False, "error": f"Sin conexión con BCRA luego de 3 intentos: {str(e)}"}
+            ultimo_error = str(e)
+            continue
+    return {"ok": False, "error": f"Sin conexión con BCRA luego de 3 intentos. {ultimo_error}"}
 
 async def consultar_cheques_rechazados(cuit: str) -> dict:
     cuit_limpio = re.sub(r"[-\s]", "", cuit)
