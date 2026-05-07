@@ -16,7 +16,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # TOKENS
-TELEGRAM_TOKEN = "8764473072:AAG1v2uRuyNFaxxW9gl_xddwZNS2cx4Bvwc"
+TELEGRAM_TOKEN = "8764473072:AAF6k65gSsVvjvF-N6WTbXwVBMiq2-mvOdg"
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # SEGURIDAD — solo responde en este grupo y a este usuario
