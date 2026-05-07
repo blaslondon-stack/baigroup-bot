@@ -15,8 +15,11 @@ except ImportError:
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# TOKENS
-TELEGRAM_TOKEN = "8764473072:AAH4JRHK-PuAkwiZcurjAADuRL55-o55K_E"
+# Endpoint HTTP /notify (corre en thread separado)
+from notify_api import start_notify_api
+
+# TOKENS — leer SIEMPRE de env vars (nunca hardcodear)
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # SEGURIDAD — solo responde en este grupo y a este usuario
@@ -1350,6 +1353,9 @@ def main():
     )
     app.add_handler(CommandHandler("hoy", cheques_hoy_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Endpoint HTTP /notify (Claude in Chrome → grupo de Telegram)
+    start_notify_api(telegram_token=TELEGRAM_TOKEN)
 
     print("🚀 BAI Group Bot iniciado...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
