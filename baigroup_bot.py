@@ -1331,6 +1331,68 @@ async def buscar_cmd(update, context):
         await msg.edit_text(f"❌ No se encontraron resultados para *{query}*.", parse_mode="Markdown")
         return
 
+    # ───── 1 SOLO RESULTADO → FICHA DETALLADA ─────
+    if len(encontrados) == 1:
+        r = encontrados[0]
+        tipo = "📱 ECHEQ" if r.get("tipo") == "ECHEQ" else "📄 FÍSICO"
+
+        # Estado de depósito
+        destinatario = r.get("destinatario", "").strip()
+        if destinatario:
+            estado_dep = f"✅ DEPOSITADO en {destinatario}"
+        elif r.get("venc_dt") and r["venc_dt"] < hoy:
+            estado_dep = "🔴 VENCIDO — sin depositar"
+        else:
+            estado_dep = "⚠️ PENDIENTE de depósito"
+
+        # Días al vencimiento
+        if r.get("venc_dt"):
+            dias = (r["venc_dt"] - hoy).days
+            if dias < 0:
+                dias_txt = f"hace {abs(dias)} días"
+            elif dias == 0:
+                dias_txt = "HOY"
+            elif dias == 1:
+                dias_txt = "mañana"
+            else:
+                dias_txt = f"en {dias} días"
+        else:
+            dias_txt = "-"
+
+        # Disponible desde
+        disp_desde = r.get("fecha", "") or "-"
+        if r.get("fecha_dt"):
+            dias_disp = (hoy - r["fecha_dt"]).days
+            if dias_disp >= 0:
+                disp_marca = "🟢"
+            else:
+                disp_marca = "🟡"
+            disp_desde = f"{disp_marca} {disp_desde}"
+
+        cuit = r.get("cuit", "")
+        cuit_limpio = re.sub(r"[-\s]", "", cuit)
+
+        lineas = [f"🎯 *CHEQUE ENCONTRADO*\n"]
+        lineas.append(f"📄 *Número:* `{r.get('numero', '-')}`")
+        lineas.append(f"👤 *Librador:* {r.get('titular', '-')}")
+        if cuit:
+            lineas.append(f"🆔 *CUIT:* `{cuit}`")
+        lineas.append(f"💰 *Importe:* ${r.get('importe', 0):,.0f}")
+        lineas.append(f"📅 *Vencimiento:* {r.get('vencimiento', '-')} ({dias_txt})")
+        lineas.append(f"🗓️ *Disponible desde:* {disp_desde}")
+        lineas.append(f"🏷️ *Tipo:* {tipo}")
+        if r.get("cliente"):
+            lineas.append(f"🧑‍💼 *Cliente:* {r['cliente']}")
+        if r.get("estado"):
+            lineas.append(f"📊 *Estado planilla:* {r['estado']}")
+        lineas.append(f"\n{estado_dep}")
+        if cuit_limpio:
+            lineas.append(f"\n👉 /evaluar {cuit_limpio}")
+
+        await msg.edit_text("\n".join(lineas), parse_mode="Markdown")
+        return
+
+    # ───── MÚLTIPLES RESULTADOS → RESUMEN + LISTA ─────
     # Separar pendientes y depositados
     pendientes = [r for r in encontrados if not r.get("destinatario") and r.get("venc_dt") and r["venc_dt"] >= hoy]
     depositados = [r for r in encontrados if r.get("destinatario")]
@@ -1352,13 +1414,19 @@ async def buscar_cmd(update, context):
         pendientes.sort(key=lambda x: x.get("venc_dt") or hoy)
         for r in pendientes[:10]:
             dias = (r["venc_dt"] - hoy).days if r.get("venc_dt") else 0
+            numero = r.get("numero", "")
             cuit = r.get("cuit", "")
             tipo = "ECHEQ" if r.get("tipo") == "ECHEQ" else "FÍSICO"
-            lineas.append(f"• {r['titular'][:25]} | {tipo} | ${r['importe']:,.0f} | Vence: {r['vencimiento']} ({dias}d)")
+            linea = f"• {r['titular'][:25]} | {tipo} | ${r['importe']:,.0f} | Vto: {r['vencimiento']} ({dias}d)"
+            if numero:
+                linea += f"\n  Nº `{numero}` → /buscar {numero}"
+            lineas.append(linea)
             if cuit:
                 lineas.append(f"  👉 /evaluar {cuit}")
         if len(pendientes) > 10:
             lineas.append(f"_...y {len(pendientes)-10} más_")
+
+    lineas.append(f"\n💡 _Buscá un número específico para ver el detalle completo_")
 
     await msg.edit_text("\n".join(lineas), parse_mode="Markdown")
 
