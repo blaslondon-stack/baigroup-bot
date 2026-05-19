@@ -1267,7 +1267,12 @@ async def buscar_cmd(update, context):
 
     if not context.args:
         await update.message.reply_text(
-            "🔍 Usá: `/buscar [nombre]`\nEj: `/buscar GABUCCI` o `/buscar RUBEN URSINO`",
+            "🔍 Usá: `/buscar [texto]`\n\n"
+            "Podés buscar por:\n"
+            "• Cliente/titular: `/buscar GABUCCI`\n"
+            "• Número de cheque: `/buscar 11201006`\n"
+            "• Importe: `/buscar 2000000` o `/buscar 2M`\n"
+            "• CUIT: `/buscar 20264626268`",
             parse_mode="Markdown"
         )
         return
@@ -1282,12 +1287,45 @@ async def buscar_cmd(update, context):
 
     hoy = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
 
-    # Buscar en titular y cliente
-    encontrados = [
-        r for r in registros
-        if query in r.get("titular", "").upper()
-        or query in r.get("cliente", "").upper()
-    ]
+    # Detectar si la query es un importe (números, opcionalmente con M o K)
+    importe_buscado = None
+    q_clean = query.replace(".", "").replace(",", "").replace("$", "").replace(" ", "")
+    if q_clean.endswith("M"):
+        try: importe_buscado = float(q_clean[:-1]) * 1_000_000
+        except ValueError: pass
+    elif q_clean.endswith("K"):
+        try: importe_buscado = float(q_clean[:-1]) * 1_000
+        except ValueError: pass
+    elif q_clean.isdigit() and len(q_clean) >= 6:
+        try:
+            n = float(q_clean)
+            if n >= 100_000: importe_buscado = n
+        except ValueError: pass
+
+    query_cuit = query.replace("-", "").replace(" ", "")
+
+    # Buscar en titular, cliente, número de cheque, CUIT e importe
+    encontrados = []
+    for r in registros:
+        titular = r.get("titular", "").upper()
+        cliente = r.get("cliente", "").upper()
+        numero  = str(r.get("numero", "")).upper()
+        cuit    = str(r.get("cuit", "")).replace("-", "").replace(" ", "")
+
+        # Match por texto
+        if (query in titular or query in cliente or
+            (numero and query in numero) or
+            (query_cuit and query_cuit in cuit)):
+            encontrados.append(r)
+            continue
+
+        # Match por importe (tolerancia $1)
+        if importe_buscado is not None:
+            try:
+                if abs(float(r.get("importe", 0)) - importe_buscado) < 1:
+                    encontrados.append(r)
+            except (ValueError, TypeError):
+                pass
 
     if not encontrados:
         await msg.edit_text(f"❌ No se encontraron resultados para *{query}*.", parse_mode="Markdown")
