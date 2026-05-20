@@ -542,17 +542,32 @@ def parse_importe(s):
         return 0
 
 async def leer_cheques_sheet() -> list:
-    """Lee el Google Sheet de cheques y retorna lista de registros"""
-    url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={SHEET_GID}"
+    """Lee el Google Sheet de cheques y retorna lista de registros.
+
+    Usa cache-buster + headers anti-cache para evitar que Google sirva
+    una versión cacheada del CSV (problema conocido del endpoint /export).
+    """
+    # Cache-buster con timestamp en milisegundos
+    cache_buster = int(datetime.now().timestamp() * 1000)
+    url = (
+        f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export"
+        f"?format=csv&gid={SHEET_GID}&t={cache_buster}"
+    )
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    }
     try:
         async with httpx.AsyncClient(timeout=30, verify=False, follow_redirects=True) as client:
-            r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            r = await client.get(url, headers=headers)
             if r.status_code != 200:
                 return []
-        
+
         lines = r.text.split("\n")
         registros = []
-        
+
         for line in lines[5:]:  # Skip 5 filas de header
             cols = parse_csv_line(line)
             if len(cols) < 10:
@@ -564,7 +579,7 @@ async def leer_cheques_sheet() -> list:
             # Si no hay titular, usar el número de cheque o "Sin identificar"
             if not titular:
                 titular = f"Nro {cols[3].strip()}" if len(cols) > 3 and cols[3].strip() else "Sin identificar"
-            
+
             registros.append({
                 "tipo": cols[0].strip(),          # ECHEQ / vacío
                 "fecha": cols[1].strip(),          # desde cuándo depositar
@@ -579,7 +594,7 @@ async def leer_cheques_sheet() -> list:
                 "venc_dt": parse_fecha(cols[9]),
                 "estado": cols[11].strip() if len(cols) > 11 else "",
             })
-        
+
         return registros
     except Exception as e:
         return []
