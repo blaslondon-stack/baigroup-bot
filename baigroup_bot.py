@@ -580,9 +580,18 @@ async def leer_cheques_sheet() -> list:
             if not titular:
                 titular = f"Nro {cols[3].strip()}" if len(cols) > 3 and cols[3].strip() else "Sin identificar"
 
+            # Columna M (índice 12) — Rechazos del librador
+            # Acepta numérico (0, 1, 2...) o texto (SI/NO/RECHAZADO/vacío)
+            rechazado_raw = cols[12].strip() if len(cols) > 12 else ""
+            try:
+                rechazos = int(rechazado_raw) if rechazado_raw else 0
+            except ValueError:
+                # Si no es número, interpretamos texto
+                rechazos = 1 if rechazado_raw.upper() in ("SI", "SÍ", "RECHAZADO", "X", "TRUE") else 0
+
             registros.append({
                 "tipo": cols[0].strip(),          # ECHEQ / vacío
-                "fecha": cols[1].strip(),          # desde cuándo depositar
+                "fecha": cols[1].strip(),          # desde cuándo depositar (FECHA DE PAGO)
                 "fecha_dt": parse_fecha(cols[1]),
                 "numero": cols[3].strip(),
                 "titular": titular,
@@ -593,6 +602,8 @@ async def leer_cheques_sheet() -> list:
                 "vencimiento": cols[9].strip(),
                 "venc_dt": parse_fecha(cols[9]),
                 "estado": cols[11].strip() if len(cols) > 11 else "",
+                "rechazos": rechazos,              # col M: cantidad de rechazos
+                "rechazado_raw": rechazado_raw,    # texto crudo de col M
             })
 
         return registros
@@ -1360,21 +1371,21 @@ async def buscar_cmd(update, context):
         else:
             estado_dep = "⚠️ PENDIENTE de depósito"
 
-        # Días al vencimiento
-        if r.get("venc_dt"):
-            dias = (r["venc_dt"] - hoy).days
+        # Días a la fecha de depósito
+        if r.get("fecha_dt"):
+            dias = (r["fecha_dt"] - hoy).days
             if dias < 0:
-                dias_txt = f"hace {abs(dias)} días"
+                dias_txt = f"habilitado hace {abs(dias)}d"
             elif dias == 0:
                 dias_txt = "HOY"
             elif dias == 1:
                 dias_txt = "mañana"
             else:
-                dias_txt = f"en {dias} días"
+                dias_txt = f"en {dias}d"
         else:
             dias_txt = "-"
 
-        # Disponible desde
+        # Marca visual de habilitación
         disp_desde = r.get("fecha", "") or "-"
         if r.get("fecha_dt"):
             dias_disp = (hoy - r["fecha_dt"]).days
@@ -1393,11 +1404,13 @@ async def buscar_cmd(update, context):
         if cuit:
             lineas.append(f"🆔 *CUIT:* `{cuit}`")
         lineas.append(f"💰 *Importe:* ${r.get('importe', 0):,.0f}")
-        lineas.append(f"📅 *Vencimiento:* {r.get('vencimiento', '-')} ({dias_txt})")
-        lineas.append(f"🗓️ *Disponible desde:* {disp_desde}")
+        lineas.append(f"💳 *Fecha de depósito:* {disp_desde} ({dias_txt})")
         lineas.append(f"🏷️ *Tipo:* {tipo}")
         if r.get("cliente"):
             lineas.append(f"🧑‍💼 *Cliente:* {r['cliente']}")
+        rechazos = r.get("rechazos", 0)
+        if rechazos > 0:
+            lineas.append(f"🚨 *Rechazos del librador:* {rechazos}")
         if r.get("estado"):
             lineas.append(f"📊 *Estado planilla:* {r['estado']}")
         lineas.append(f"\n{estado_dep}")
@@ -1425,21 +1438,33 @@ async def buscar_cmd(update, context):
         lineas.append(f"🔴 Vencidos sin depositar: {len(vencidos)} — ${total_venc:,.0f}")
 
     if pendientes:
-        lineas.append(f"\n📋 *PENDIENTES:*")
-        pendientes.sort(key=lambda x: x.get("venc_dt") or hoy)
-        for r in pendientes[:10]:
-            dias = (r["venc_dt"] - hoy).days if r.get("venc_dt") else 0
+        lineas.append(f"\n📋 *PENDIENTES — ordenados por fecha de pago:*")
+        # Ordenar por fecha de pago (col B), no por vencimiento
+        pendientes.sort(key=lambda x: x.get("fecha_dt") or hoy)
+        for r in pendientes[:30]:
+            fecha_pago = r.get("fecha", "") or "-"
+            dias_pago = (r["fecha_dt"] - hoy).days if r.get("fecha_dt") else None
+            if dias_pago is None:
+                dias_txt = ""
+            elif dias_pago < 0:
+                dias_txt = f"(habilitado, hace {abs(dias_pago)}d)"
+            elif dias_pago == 0:
+                dias_txt = "(HOY)"
+            elif dias_pago == 1:
+                dias_txt = "(mañana)"
+            else:
+                dias_txt = f"(en {dias_pago}d)"
             numero = r.get("numero", "")
-            cuit = r.get("cuit", "")
             tipo = "ECHEQ" if r.get("tipo") == "ECHEQ" else "FÍSICO"
-            linea = f"• {r['titular'][:25]} | {tipo} | ${r['importe']:,.0f} | Vto: {r['vencimiento']} ({dias}d)"
+            rechazos = r.get("rechazos", 0)
+            flag_rechazo = f" 🚨 x{rechazos}" if rechazos > 0 else ""
+            linea = f"• {fecha_pago} {dias_txt} | ${r['importe']:,.0f} | {tipo}{flag_rechazo}"
+            linea += f"\n  {r['titular'][:30]}"
             if numero:
-                linea += f"\n  Nº `{numero}` → /buscar {numero}"
+                linea += f" — Nº `{numero}`"
             lineas.append(linea)
-            if cuit:
-                lineas.append(f"  👉 /evaluar {cuit}")
-        if len(pendientes) > 10:
-            lineas.append(f"_...y {len(pendientes)-10} más_")
+        if len(pendientes) > 30:
+            lineas.append(f"_...y {len(pendientes)-30} más_")
 
     lineas.append(f"\n💡 _Buscá un número específico para ver el detalle completo_")
 
