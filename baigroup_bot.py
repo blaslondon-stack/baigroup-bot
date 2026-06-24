@@ -24,7 +24,7 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # SEGURIDAD — solo responde en este grupo y a este usuario
 GRUPO_PERMITIDO = -5265832156
-USUARIOS_PERMITIDOS = {55179603}  # Agregar más IDs acá si sumás equipo
+USUARIOS_PERMITIDOS = {55179603, 1056894992}  # Agregar más IDs acá si sumás equipo
 
 async def check_acceso(update: Update) -> bool:
     """Verifica que el mensaje viene del grupo autorizado o del usuario autorizado"""
@@ -856,8 +856,12 @@ async def manana_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 # ALERTA MATUTINA AUTOMÁTICA
 # ─────────────────────────────────────────────
-async def alerta_matutina(context):
-    """Se ejecuta automáticamente cada mañana a las 8hs"""
+async def alerta_matutina(context, target_chat_id=None):
+    """Se ejecuta automáticamente cada mañana a las 8hs.
+
+    Si se invoca con target_chat_id, envía a ese chat (útil para /buenos_dias
+    desde privado). Si no, envía al grupo de operaciones por defecto.
+    """
     try:
         registros = await leer_cheques_sheet()
         if not registros:
@@ -954,7 +958,7 @@ async def alerta_matutina(context):
         lineas.append("\n_Usá /hoy, /semana o /cheques para más detalle._")
 
         await context.bot.send_message(
-            chat_id=GRUPO_PERMITIDO,
+            chat_id=target_chat_id if target_chat_id else GRUPO_PERMITIDO,
             text="\n".join(lineas),
             parse_mode="Markdown"
         )
@@ -1496,10 +1500,11 @@ async def buscar_cmd(update, context):
 # COMANDO /buenos_dias — Ejecuta la alerta matutina on-demand
 # ─────────────────────────────────────────────
 async def buenos_dias_cmd(update, context):
-    """Dispara manualmente el mensaje de alerta matutina (para testing)."""
+    """Dispara manualmente el mensaje de alerta matutina (para testing).
+    Responde en el mismo chat desde donde se invocó (grupo o privado)."""
     if not await check_acceso(update): return
     await update.message.reply_text("☀️ Generando reporte matutino...")
-    await alerta_matutina(context)
+    await alerta_matutina(context, target_chat_id=update.effective_chat.id)
 
 # ─────────────────────────────────────────────
 # MAIN
