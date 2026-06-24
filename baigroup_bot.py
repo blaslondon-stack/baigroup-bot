@@ -929,6 +929,28 @@ async def alerta_matutina(context):
                     lineas.append(f"   • {p['titular'][:25]} | ${p['importe']:,.0f} | Vence en {dias}d")
 
         lineas.append(f"\n💰 *Cartera total pendiente:* ${total_cartera:,.0f}")
+
+        # Desglose por mes (según fecha de pago / col B)
+        from collections import defaultdict
+        meses_es = ["Enero","Febrero","Marzo","Abril","Mayo","Junio",
+                    "Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"]
+        por_mes = defaultdict(float)
+        for r in registros:
+            if r.get("destinatario"):
+                continue
+            f_dt = r.get("fecha_dt")
+            if not f_dt or f_dt < hoy:
+                continue
+            clave = (f_dt.year, f_dt.month)
+            por_mes[clave] += r["importe"]
+        if por_mes:
+            lineas.append("")  # línea en blanco
+            for (anio, mes) in sorted(por_mes.keys()):
+                nombre_mes = meses_es[mes-1]
+                # Si es el año actual no lo muestro; si no, sí
+                etiqueta = nombre_mes if anio == hoy.year else f"{nombre_mes} {anio}"
+                lineas.append(f"   • {etiqueta}: ${por_mes[(anio, mes)]:,.0f}")
+
         lineas.append("\n_Usá /hoy, /semana o /cheques para más detalle._")
 
         await context.bot.send_message(
@@ -1471,6 +1493,15 @@ async def buscar_cmd(update, context):
     await msg.edit_text("\n".join(lineas), parse_mode="Markdown")
 
 # ─────────────────────────────────────────────
+# COMANDO /buenos_dias — Ejecuta la alerta matutina on-demand
+# ─────────────────────────────────────────────
+async def buenos_dias_cmd(update, context):
+    """Dispara manualmente el mensaje de alerta matutina (para testing)."""
+    if not await check_acceso(update): return
+    await update.message.reply_text("☀️ Generando reporte matutino...")
+    await alerta_matutina(context)
+
+# ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
 def main():
@@ -1490,6 +1521,7 @@ def main():
     app.add_handler(CommandHandler("analizar", analizar_cmd))
     app.add_handler(CommandHandler("buscar", buscar_cmd))
     app.add_handler(CommandHandler("dolar", dolar_cmd))
+    app.add_handler(CommandHandler("buenos_dias", buenos_dias_cmd))
 
     # Alerta matutina automática a las 8:00hs (UTC-3 = 11:00 UTC)
     app.job_queue.run_daily(
