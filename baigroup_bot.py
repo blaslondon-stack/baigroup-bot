@@ -788,13 +788,46 @@ async def semana_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lineas.append(formato_cheque(p))
             lineas.append("")
 
-    # Dividir en mensajes si es muy largo
+    # Dividir en mensajes si es muy largo (por líneas completas, no por caracteres)
     texto = "\n".join(lineas)
-    if len(texto) > 4000:
-        await msg.edit_text(texto[:4000], parse_mode="Markdown")
-        await update.message.reply_text(texto[4000:], parse_mode="Markdown")
+    LIMITE = 3800  # margen seguro bajo el límite de Telegram (4096)
+
+    async def enviar_seguro(texto_a_enviar, es_primero=False):
+        """Envía con Markdown; si Telegram lo rechaza, reintenta sin formato."""
+        try:
+            if es_primero:
+                await msg.edit_text(texto_a_enviar, parse_mode="Markdown")
+            else:
+                await update.message.reply_text(texto_a_enviar, parse_mode="Markdown")
+        except Exception:
+            # Markdown roto → mandar en texto plano
+            plano = texto_a_enviar.replace("*", "").replace("_", "").replace("`", "")
+            if es_primero:
+                await msg.edit_text(plano)
+            else:
+                await update.message.reply_text(plano)
+
+    if len(texto) <= LIMITE:
+        await enviar_seguro(texto, es_primero=True)
     else:
-        await msg.edit_text(texto, parse_mode="Markdown")
+        # Partir por líneas, respetando estructura
+        chunks = []
+        actual = []
+        largo_actual = 0
+        for linea in lineas:
+            largo_linea = len(linea) + 1  # +1 por el \n
+            if largo_actual + largo_linea > LIMITE and actual:
+                chunks.append("\n".join(actual))
+                actual = [linea]
+                largo_actual = largo_linea
+            else:
+                actual.append(linea)
+                largo_actual += largo_linea
+        if actual:
+            chunks.append("\n".join(actual))
+
+        for i, chunk in enumerate(chunks):
+            await enviar_seguro(chunk, es_primero=(i == 0))
 
 
 # ─────────────────────────────────────────────
