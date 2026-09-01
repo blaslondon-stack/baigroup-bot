@@ -594,11 +594,11 @@ async def leer_cheques_sheet() -> list:
             # Cuando col I tiene valor = ya lo depositamos.
             cerrado = bool(cols[8].strip())
 
-            # "En la calle" = col J explícita ("EN LA CALLE" u "OJO").
-            # Significa: el cliente dejó el cheque pero todavía NO llegó a la oficina.
-            # Si col J está vacía y col I está vacía, el cheque está en la oficina.
+            # "En la calle" = col J contiene "CALLE" en cualquier forma
+            # ("CALLE", "EN LA CALLE", "EN CALLE") o dice OJO
             en_la_calle = (
-                estado_cheque in ("EN LA CALLE", "OJO")
+                "CALLE" in estado_cheque
+                or estado_cheque == "OJO"
                 or dias_en_calle.upper() == "OJO"
             )
             # Alerta OJO: la fórmula de col K lo marca cuando pasa >1 día en la calle
