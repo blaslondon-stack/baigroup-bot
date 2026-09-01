@@ -590,16 +590,15 @@ async def leer_cheques_sheet() -> list:
             dia_anotado = cols[12].strip() if len(cols) > 12 else ""
             banco = cols[13].strip() if len(cols) > 13 else ""
 
-            # Un cheque se considera CERRADO SOLO si tiene destinatario (col I)
-            # Los estados OK/ACREDITADO/RECHAZADO también son terminales, pero
-            # en la práctica si están acreditados también tienen destinatario.
+            # Un cheque se considera CERRADO SOLO si tiene destinatario (col I).
+            # Cuando col I tiene valor = ya lo depositamos.
             cerrado = bool(cols[8].strip())
 
-            # "En la calle" = está en tenencia de alguien (col L con valor)
-            # o el estado J lo dice explícitamente. La tenencia es el indicador principal.
+            # "En la calle" = col J explícita ("EN LA CALLE" u "OJO").
+            # Significa: el cliente dejó el cheque pero todavía NO llegó a la oficina.
+            # Si col J está vacía y col I está vacía, el cheque está en la oficina.
             en_la_calle = (
-                bool(tenencia)
-                or estado_cheque in ("EN LA CALLE", "OJO")
+                estado_cheque in ("EN LA CALLE", "OJO")
                 or dias_en_calle.upper() == "OJO"
             )
             # Alerta OJO: la fórmula de col K lo marca cuando pasa >1 día en la calle
@@ -769,30 +768,20 @@ async def cheques_hoy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if en_calle:
         subtotal = sum(p["importe"] for p in en_calle)
         lineas.append(f"📤 *EN LA CALLE — {len(en_calle)} cheques — ${subtotal:,.0f}*")
-        lineas.append("_(en tenencia de alguien, aún sin acreditar)_")
+        lineas.append("_(el cliente los dejó, aún no llegaron a la oficina)_")
         for p in en_calle:
-            tenencia = p.get("tenencia", "")
-            linea = f"• {linea_cheque(p)}"
-            if tenencia:
-                linea += f"\n   📍 En tenencia de {tenencia}"
-            lineas.append(linea)
+            lineas.append(f"• {linea_cheque(p)}")
         lineas.append("")
 
     if en_ojo:
         subtotal = sum(p["importe"] for p in en_ojo)
         lineas.append(f"🚨 *OJO — {len(en_ojo)} cheques — ${subtotal:,.0f}*")
-        lineas.append("_(más de 1 día en la calle, revisar)_")
+        lineas.append("_(más de 1 día en la calle sin llegar, revisar)_")
         for p in en_ojo:
-            tenencia = p.get("tenencia", "")
             dias_calle = p.get("dias_en_calle", "")
             linea = f"• {linea_cheque(p)}"
-            extras = []
-            if tenencia:
-                extras.append(f"📍 En tenencia de {tenencia}")
             if dias_calle.isdigit():
-                extras.append(f"⏱️ {dias_calle}d en calle")
-            if extras:
-                linea += f"\n   " + " | ".join(extras)
+                linea += f"\n   ⏱️ {dias_calle}d en calle"
             lineas.append(linea)
 
     texto = "\n".join(lineas)
@@ -1115,12 +1104,11 @@ async def alerta_cheques_calle(context, target_chat_id=None):
         total = sum(r["importe"] for r in en_ojo)
 
         lineas = [f"🚨 *CHEQUES EN LA CALLE — REVISAR*"]
-        lineas.append(f"_Más de 1 día sin novedades_\n")
+        lineas.append(f"_Más de 1 día sin llegar a la oficina_\n")
         lineas.append(f"📊 {len(en_ojo)} cheques — *${total:,.0f}*\n")
 
         for r in en_ojo:
             dias = r.get("dias_en_calle", "")
-            # Si "dias" es un número, mostrarlo; si es "OJO", decir "hace días"
             if dias.isdigit():
                 dias_txt = f"en la calle hace {dias} días"
             else:
@@ -1130,7 +1118,6 @@ async def alerta_cheques_calle(context, target_chat_id=None):
             importe = r.get("importe", 0)
             numero = r.get("numero", "")
             cliente = r.get("cliente", "")
-            tenencia = r.get("tenencia", "")
 
             lineas.append(f"📄 *{titular}* | ${importe:,.0f}")
             detalles = []
@@ -1138,8 +1125,6 @@ async def alerta_cheques_calle(context, target_chat_id=None):
                 detalles.append(f"Nº `{numero}`")
             if cliente:
                 detalles.append(f"🧑‍💼 {cliente}")
-            if tenencia:
-                detalles.append(f"📍 {tenencia}")
             if detalles:
                 lineas.append("   " + " | ".join(detalles))
             lineas.append(f"   ⏱️ {dias_txt}")
