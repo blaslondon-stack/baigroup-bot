@@ -590,14 +590,19 @@ async def leer_cheques_sheet() -> list:
             dia_anotado = cols[12].strip() if len(cols) > 12 else ""
             banco = cols[13].strip() if len(cols) > 13 else ""
 
-            # Un cheque se considera CERRADO si:
-            #  - tiene destinatario (col I), o
-            #  - su estado en col J es OK/ACREDITADO/RECHAZADO
-            estados_cerrados = ("OK", "ACREDITADO", "RECHAZADO")
-            cerrado = bool(cols[8].strip()) or estado_cheque in estados_cerrados
+            # Un cheque se considera CERRADO SOLO si tiene destinatario (col I)
+            # Los estados OK/ACREDITADO/RECHAZADO también son terminales, pero
+            # en la práctica si están acreditados también tienen destinatario.
+            cerrado = bool(cols[8].strip())
 
-            # "En la calle" = estado EN LA CALLE o OJO (la K con fórmula lo pone en OJO tras 1 día)
-            en_la_calle = estado_cheque in ("EN LA CALLE", "OJO") or dias_en_calle.upper() == "OJO"
+            # "En la calle" = está en tenencia de alguien (col L con valor)
+            # o el estado J lo dice explícitamente. La tenencia es el indicador principal.
+            en_la_calle = (
+                bool(tenencia)
+                or estado_cheque in ("EN LA CALLE", "OJO")
+                or dias_en_calle.upper() == "OJO"
+            )
+            # Alerta OJO: la fórmula de col K lo marca cuando pasa >1 día en la calle
             alerta_ojo = estado_cheque == "OJO" or dias_en_calle.upper() == "OJO"
 
             registros.append({
@@ -734,7 +739,7 @@ async def cheques_hoy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Separar en 3 grupos según estado
     en_ojo = [r for r in disponibles if r.get("alerta_ojo")]
     en_calle = [r for r in disponibles if r.get("en_la_calle") and not r.get("alerta_ojo")]
-    en_mano = [r for r in disponibles if not r.get("en_la_calle")]
+    en_oficina = [r for r in disponibles if not r.get("en_la_calle")]
 
     def linea_cheque(p):
         dias_atraso = (hoy - p["fecha_dt"]).days
@@ -753,23 +758,23 @@ async def cheques_hoy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lineas = [f"*CHEQUES DISPONIBLES — {hoy.strftime('%d/%m/%Y')}*"]
     lineas.append(f"Total: {len(disponibles)} cheques | *${total:,.0f}*\n")
 
-    if en_mano:
-        subtotal = sum(p["importe"] for p in en_mano)
-        lineas.append(f"📥 *EN MANO — {len(en_mano)} cheques — ${subtotal:,.0f}*")
+    if en_oficina:
+        subtotal = sum(p["importe"] for p in en_oficina)
+        lineas.append(f"🏢 *EN LA OFICINA — {len(en_oficina)} cheques — ${subtotal:,.0f}*")
         lineas.append("_(pendientes de mandar a depositar)_")
-        for p in en_mano:
+        for p in en_oficina:
             lineas.append(f"• {linea_cheque(p)}")
         lineas.append("")
 
     if en_calle:
         subtotal = sum(p["importe"] for p in en_calle)
         lineas.append(f"📤 *EN LA CALLE — {len(en_calle)} cheques — ${subtotal:,.0f}*")
-        lineas.append("_(depositados, aún sin novedades)_")
+        lineas.append("_(en tenencia de alguien, aún sin acreditar)_")
         for p in en_calle:
             tenencia = p.get("tenencia", "")
             linea = f"• {linea_cheque(p)}"
             if tenencia:
-                linea += f"\n   📍 {tenencia}"
+                linea += f"\n   📍 En tenencia de {tenencia}"
             lineas.append(linea)
         lineas.append("")
 
@@ -783,7 +788,7 @@ async def cheques_hoy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             linea = f"• {linea_cheque(p)}"
             extras = []
             if tenencia:
-                extras.append(f"📍 {tenencia}")
+                extras.append(f"📍 En tenencia de {tenencia}")
             if dias_calle.isdigit():
                 extras.append(f"⏱️ {dias_calle}d en calle")
             if extras:
@@ -817,14 +822,14 @@ async def semana_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hoy = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     limite = hoy + timedelta(days=7)
 
-    # Cheques SIN destinatario cuya FECHA DE HABILITACIÓN (col B) cae esta semana
-    # Es decir: se habilitan para depositar entre hoy y los próximos 7 días
+    # Cheques SIN destinatario cuya fecha de liberación cae:
+    #  - En los próximos 7 días (todavía no llegaron a fecha), o
+    #  - Ya está liberado pero aún no acreditado (atrasado / en la calle / OJO)
     proximos = [
         r for r in registros
         if not r.get("cerrado")
-        and r["fecha_dt"] and r["fecha_dt"] >= hoy  # no vencidos
         and r["fecha_dt"]
-        and hoy <= r["fecha_dt"] <= limite  # se habilitan esta semana
+        and r["fecha_dt"] <= limite  # hasta 7 días adelante (los atrasados también entran)
     ]
 
     if not proximos:
