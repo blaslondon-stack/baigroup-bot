@@ -707,41 +707,100 @@ async def cheques_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cheques_hoy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_acceso(update): return
-    """Muestra solo los cheques disponibles para depositar HOY"""
+    """Muestra cheques cuya fecha de liberación es HOY o anterior, todavía sin acreditar.
+    Incluye los que ya están 'en la calle' y los que tienen alerta OJO."""
     msg = await update.message.reply_text("Consultando cheques disponibles hoy...", parse_mode="Markdown")
     registros = await leer_cheques_sheet()
     if not registros:
         await msg.edit_text("No se pudo leer la planilla.", parse_mode="Markdown")
         return
+
     hoy = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Cheques cuya fecha de liberación es <= hoy y todavía no acreditados/rechazados
+    # (no filtramos por "cerrado" porque queremos incluir los EN LA CALLE)
+    estados_finales = ("OK", "ACREDITADO", "RECHAZADO")
     disponibles = [
         r for r in registros
-        if not r.get("cerrado")
-        and r["fecha_dt"] and r["fecha_dt"] <= hoy
-        and r["fecha_dt"] and r["fecha_dt"] >= hoy
+        if r.get("fecha_dt") and r["fecha_dt"] <= hoy
+        and not r.get("destinatario")
+        and r.get("estado_cheque", "") not in estados_finales
     ]
+
     if not disponibles:
-        await msg.edit_text("No hay cheques disponibles para depositar hoy sin destinatario.", parse_mode="Markdown")
+        await msg.edit_text("No hay cheques disponibles para depositar hoy.", parse_mode="Markdown")
         return
-    disponibles.sort(key=lambda x: x["fecha_dt"])
-    total = sum(p["importe"] for p in disponibles)
-    lineas = ["*CHEQUES DISPONIBLES HOY*", f"Total: {len(disponibles)} cheques | ${total:,.0f}", ""]
-    for p in disponibles:
-        dias_venc = (p["fecha_dt"] - hoy).days
-        tipo = "ECHEQ" if p["tipo"] == "ECHEQ" else "FISICO"
-        emoji = "🔴" if dias_venc <= 3 else "🟡" if dias_venc <= 7 else "🟢"
+
+    # Separar en 3 grupos según estado
+    en_ojo = [r for r in disponibles if r.get("alerta_ojo")]
+    en_calle = [r for r in disponibles if r.get("en_la_calle") and not r.get("alerta_ojo")]
+    en_mano = [r for r in disponibles if not r.get("en_la_calle")]
+
+    def linea_cheque(p):
+        dias_atraso = (hoy - p["fecha_dt"]).days
+        tipo = "ECHEQ" if p["tipo"] == "ECHEQ" else "FÍSICO"
         titular = p["titular"][:28]
         numero = p["numero"]
         imp = p["importe"]
         cli = p["cliente"]
-        venc = p["vencimiento"]
-        cuit = p["cuit"]
-        linea = (f"{emoji} *{titular}* | {tipo} Nro:{numero} | "
-                 f"${imp:,.0f} | {cli} | Se libera:{venc}({dias_venc}d)")
-        lineas.append(linea)
-        if cuit:
-            lineas.append(f"   👉 /evaluar {cuit}")
-    await msg.edit_text("\n".join(lineas), parse_mode="Markdown")
+        fecha = p["fecha"]
+        atraso_txt = f"(hoy)" if dias_atraso == 0 else f"({dias_atraso}d atrás)"
+        base = (f"*{titular}* | {tipo} Nº {numero} | "
+                f"${imp:,.0f} | {cli} | Se liberó: {fecha} {atraso_txt}")
+        return base
+
+    total = sum(p["importe"] for p in disponibles)
+    lineas = [f"*CHEQUES DISPONIBLES — {hoy.strftime('%d/%m/%Y')}*"]
+    lineas.append(f"Total: {len(disponibles)} cheques | *${total:,.0f}*\n")
+
+    if en_mano:
+        subtotal = sum(p["importe"] for p in en_mano)
+        lineas.append(f"📥 *EN MANO — {len(en_mano)} cheques — ${subtotal:,.0f}*")
+        lineas.append("_(pendientes de mandar a depositar)_")
+        for p in en_mano:
+            lineas.append(f"• {linea_cheque(p)}")
+        lineas.append("")
+
+    if en_calle:
+        subtotal = sum(p["importe"] for p in en_calle)
+        lineas.append(f"📤 *EN LA CALLE — {len(en_calle)} cheques — ${subtotal:,.0f}*")
+        lineas.append("_(depositados, aún sin novedades)_")
+        for p in en_calle:
+            tenencia = p.get("tenencia", "")
+            linea = f"• {linea_cheque(p)}"
+            if tenencia:
+                linea += f"\n   📍 {tenencia}"
+            lineas.append(linea)
+        lineas.append("")
+
+    if en_ojo:
+        subtotal = sum(p["importe"] for p in en_ojo)
+        lineas.append(f"🚨 *OJO — {len(en_ojo)} cheques — ${subtotal:,.0f}*")
+        lineas.append("_(más de 1 día en la calle, revisar)_")
+        for p in en_ojo:
+            tenencia = p.get("tenencia", "")
+            dias_calle = p.get("dias_en_calle", "")
+            linea = f"• {linea_cheque(p)}"
+            extras = []
+            if tenencia:
+                extras.append(f"📍 {tenencia}")
+            if dias_calle.isdigit():
+                extras.append(f"⏱️ {dias_calle}d en calle")
+            if extras:
+                linea += f"\n   " + " | ".join(extras)
+            lineas.append(linea)
+
+    texto = "\n".join(lineas)
+    # Truncar si supera límite de Telegram
+    if len(texto) > 3800:
+        texto = texto[:3800] + "\n\n_...lista truncada_"
+
+    try:
+        await msg.edit_text(texto, parse_mode="Markdown")
+    except Exception:
+        # Fallback sin markdown si algo rompe el parseo
+        plano = texto.replace("*", "").replace("_", "").replace("`", "")
+        await msg.edit_text(plano)
 
 
 
