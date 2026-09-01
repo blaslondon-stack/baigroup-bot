@@ -328,7 +328,7 @@ async def evaluar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         r for r in registros
         if r.get("cuit", "").strip() == cuit
         and r.get("venc_dt") and r["venc_dt"] >= hoy
-        and not r.get("destinatario")
+        and not r.get("cerrado")
     ]
 
     if en_cartera:
@@ -336,7 +336,7 @@ async def evaluar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_cartera_general = sum(
             r["importe"] for r in registros
             if r.get("venc_dt") and r["venc_dt"] >= hoy
-            and not r.get("destinatario")
+            and not r.get("cerrado")
         )
         pct = (total_cartera_cuit / total_cartera_general * 100) if total_cartera_general > 0 else 0
         alerta_conc = "🔴 *ALERTA CONCENTRACIÓN*" if pct > 20 else ("⚠️ *Concentración moderada*" if pct > 10 else "")
@@ -580,30 +580,52 @@ async def leer_cheques_sheet() -> list:
             if not titular:
                 titular = f"Nro {cols[3].strip()}" if len(cols) > 3 and cols[3].strip() else "Sin identificar"
 
-            # Columna M (índice 12) — Rechazos del librador
-            # Acepta numérico (0, 1, 2...) o texto (SI/NO/RECHAZADO/vacío)
-            rechazado_raw = cols[12].strip() if len(cols) > 12 else ""
-            try:
-                rechazos = int(rechazado_raw) if rechazado_raw else 0
-            except ValueError:
-                # Si no es número, interpretamos texto
-                rechazos = 1 if rechazado_raw.upper() in ("SI", "SÍ", "RECHAZADO", "X", "TRUE") else 0
+            # ─── Nueva estructura del Sheet ───
+            # A(0)=CHEQUE B(1)=FECHA C(2)=FECHA ENTREGO D(3)=NUMERO E(4)=TITULAR
+            # F(5)=CUIT G(6)=IMPORTE H(7)=CLIENTE I(8)=DESTINATARIO
+            # J(9)=ESTADO CHEQUE K(10)=DIAS EN CALLE L(11)=TENENCIA M(12)=DIA ANOTADO N(13)=BANCO
+            estado_cheque = cols[9].strip().upper() if len(cols) > 9 else ""
+            dias_en_calle = cols[10].strip() if len(cols) > 10 else ""
+            tenencia = cols[11].strip() if len(cols) > 11 else ""
+            dia_anotado = cols[12].strip() if len(cols) > 12 else ""
+            banco = cols[13].strip() if len(cols) > 13 else ""
+
+            # Un cheque se considera CERRADO si:
+            #  - tiene destinatario (col I), o
+            #  - su estado en col J es OK/ACREDITADO/RECHAZADO
+            estados_cerrados = ("OK", "ACREDITADO", "RECHAZADO")
+            cerrado = bool(cols[8].strip()) or estado_cheque in estados_cerrados
+
+            # "En la calle" = estado EN LA CALLE o OJO (la K con fórmula lo pone en OJO tras 1 día)
+            en_la_calle = estado_cheque in ("EN LA CALLE", "OJO") or dias_en_calle.upper() == "OJO"
+            alerta_ojo = estado_cheque == "OJO" or dias_en_calle.upper() == "OJO"
 
             registros.append({
-                "tipo": cols[0].strip(),          # ECHEQ / vacío
-                "fecha": cols[1].strip(),          # desde cuándo depositar (FECHA DE PAGO)
+                "tipo": cols[0].strip(),           # ECHEQ / vacío
+                "fecha": cols[1].strip(),           # fecha de liberación (col B)
                 "fecha_dt": parse_fecha(cols[1]),
+                "fecha_entrego": cols[2].strip() if len(cols) > 2 else "",
                 "numero": cols[3].strip(),
                 "titular": titular,
                 "cuit": cols[5].strip(),
                 "importe": parse_importe(importe_str),
                 "cliente": cols[7].strip(),
-                "destinatario": cols[8].strip(),   # vacío = pendiente
-                "vencimiento": cols[9].strip(),
-                "venc_dt": parse_fecha(cols[9]),
-                "estado": cols[11].strip() if len(cols) > 11 else "",
-                "rechazos": rechazos,              # col M: cantidad de rechazos
-                "rechazado_raw": rechazado_raw,    # texto crudo de col M
+                "destinatario": cols[8].strip(),    # vacío = pendiente en col I
+                "estado_cheque": estado_cheque,     # col J
+                "dias_en_calle": dias_en_calle,     # col K (número o "OJO")
+                "tenencia": tenencia,               # col L (cuenta donde está)
+                "dia_anotado": dia_anotado,         # col M (fecha de carga)
+                "banco": banco,                     # col N
+                # Derivados de conveniencia
+                "cerrado": cerrado,
+                "en_la_calle": en_la_calle,
+                "alerta_ojo": alerta_ojo,
+                "rechazado": estado_cheque == "RECHAZADO",
+                # Compatibilidad con código viejo
+                "vencimiento": "",
+                "venc_dt": None,
+                "estado": estado_cheque,
+                "rechazos": 1 if estado_cheque == "RECHAZADO" else 0,
             })
 
         return registros
@@ -622,13 +644,13 @@ async def cheques_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     hoy = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
 
-    pendientes = [r for r in registros if not r["destinatario"] and r["venc_dt"] and r["venc_dt"] >= hoy]
+    pendientes = [r for r in registros if not r.get("cerrado") and r["fecha_dt"] and r["fecha_dt"] >= hoy]
 
     if not pendientes:
         await msg.edit_text("✅ No hay cheques pendientes sin destinatario.", parse_mode="Markdown")
         return
 
-    pendientes.sort(key=lambda x: x["venc_dt"])
+    pendientes.sort(key=lambda x: x["fecha_dt"])
 
     disponibles_hoy = [p for p in pendientes if p["fecha_dt"] and p["fecha_dt"] <= hoy]
     no_disponibles = [p for p in pendientes if not p["fecha_dt"] or p["fecha_dt"] > hoy]
@@ -636,9 +658,9 @@ async def cheques_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total = sum(p["importe"] for p in pendientes)
     total_disp = sum(p["importe"] for p in disponibles_hoy)
 
-    urgentes = [p for p in disponibles_hoy if p["venc_dt"] and (p["venc_dt"] - hoy).days <= 7]
-    esta_semana = [p for p in disponibles_hoy if p["venc_dt"] and 7 < (p["venc_dt"] - hoy).days <= 30]
-    mas_adelante = [p for p in disponibles_hoy if p["venc_dt"] and (p["venc_dt"] - hoy).days > 30]
+    urgentes = [p for p in disponibles_hoy if p["fecha_dt"] and (p["fecha_dt"] - hoy).days <= 7]
+    esta_semana = [p for p in disponibles_hoy if p["fecha_dt"] and 7 < (p["fecha_dt"] - hoy).days <= 30]
+    mas_adelante = [p for p in disponibles_hoy if p["fecha_dt"] and (p["fecha_dt"] - hoy).days > 30]
 
     lineas = ["📋 *CHEQUES PENDIENTES — SIN DESTINATARIO*\n"]
     lineas.append(f"💰 Total: {len(pendientes)} cheques | *${total:,.0f}*")
@@ -648,7 +670,7 @@ async def cheques_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if urgentes:
         lineas.append(f"🔴 *URGENTE — vencen en 7 días ({len(urgentes)} cheques)*")
         for p in urgentes[:10]:
-            dias = (p["venc_dt"] - hoy).days
+            dias = (p["fecha_dt"] - hoy).days
             titular = p["titular"][:25]
             venc = p["vencimiento"]
             imp = p["importe"]
@@ -661,7 +683,7 @@ async def cheques_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if esta_semana:
         lineas.append(f"\n🟡 *PRÓXIMOS 30 DÍAS ({len(esta_semana)} cheques)*")
         for p in esta_semana[:8]:
-            dias = (p["venc_dt"] - hoy).days
+            dias = (p["fecha_dt"] - hoy).days
             titular = p["titular"][:25]
             venc = p["vencimiento"]
             imp = p["importe"]
@@ -694,18 +716,18 @@ async def cheques_hoy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hoy = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     disponibles = [
         r for r in registros
-        if not r["destinatario"]
+        if not r.get("cerrado")
         and r["fecha_dt"] and r["fecha_dt"] <= hoy
-        and r["venc_dt"] and r["venc_dt"] >= hoy
+        and r["fecha_dt"] and r["fecha_dt"] >= hoy
     ]
     if not disponibles:
         await msg.edit_text("No hay cheques disponibles para depositar hoy sin destinatario.", parse_mode="Markdown")
         return
-    disponibles.sort(key=lambda x: x["venc_dt"])
+    disponibles.sort(key=lambda x: x["fecha_dt"])
     total = sum(p["importe"] for p in disponibles)
     lineas = ["*CHEQUES DISPONIBLES HOY*", f"Total: {len(disponibles)} cheques | ${total:,.0f}", ""]
     for p in disponibles:
-        dias_venc = (p["venc_dt"] - hoy).days
+        dias_venc = (p["fecha_dt"] - hoy).days
         tipo = "ECHEQ" if p["tipo"] == "ECHEQ" else "FISICO"
         emoji = "🔴" if dias_venc <= 3 else "🟡" if dias_venc <= 7 else "🟢"
         titular = p["titular"][:28]
@@ -715,7 +737,7 @@ async def cheques_hoy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         venc = p["vencimiento"]
         cuit = p["cuit"]
         linea = (f"{emoji} *{titular}* | {tipo} Nro:{numero} | "
-                 f"${imp:,.0f} | {cli} | Vence:{venc}({dias_venc}d)")
+                 f"${imp:,.0f} | {cli} | Se libera:{venc}({dias_venc}d)")
         lineas.append(linea)
         if cuit:
             lineas.append(f"   👉 /evaluar {cuit}")
@@ -740,8 +762,8 @@ async def semana_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Es decir: se habilitan para depositar entre hoy y los próximos 7 días
     proximos = [
         r for r in registros
-        if not r["destinatario"]
-        and r["venc_dt"] and r["venc_dt"] >= hoy  # no vencidos
+        if not r.get("cerrado")
+        and r["fecha_dt"] and r["fecha_dt"] >= hoy  # no vencidos
         and r["fecha_dt"]
         and hoy <= r["fecha_dt"] <= limite  # se habilitan esta semana
     ]
@@ -750,7 +772,7 @@ async def semana_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text("✅ No hay cheques venciendo en los próximos 7 días.", parse_mode="Markdown")
         return
 
-    proximos.sort(key=lambda x: x["venc_dt"])
+    proximos.sort(key=lambda x: x["fecha_dt"])
 
     # Separar por tipo
     echeq = [p for p in proximos if p["tipo"] == "ECHEQ"]
@@ -760,9 +782,9 @@ async def semana_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     def formato_cheque(p):
         cuit = p["cuit"]
         titular = p["titular"][:28]
-        dias_venc = (p["venc_dt"] - hoy).days if p.get("venc_dt") else 0
+        dias_venc = (p["fecha_dt"] - hoy).days if p.get("fecha_dt") else 0
         lineas = [f"⚠️ *{titular}* | ${p['importe']:,.0f}"]
-        lineas.append(f"   🟢 Disponible: {p['fecha']} | Vence: {p['vencimiento']} ({dias_venc}d) | {p['cliente'][:20]}")
+        lineas.append(f"   🟢 Disponible: {p['fecha']} | Se libera: {p["fecha"]} ({dias_venc}d) | {p['cliente'][:20]}")
         if cuit:
             lineas.append(f"   👉 /evaluar {cuit}")
         return "\n".join(lineas)
@@ -776,7 +798,7 @@ async def semana_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if echeq:
         lineas.append(f"💻 *ECHEQ — {len(echeq)} cheques — ${total_echeq:,.0f}*")
-        lineas.append(f"_(acreditación automática al vencimiento)_\n")
+        lineas.append(f"_(acreditación automática al liberarse)_\n")
         for p in echeq:
             lineas.append(formato_cheque(p))
             lineas.append("")
@@ -848,16 +870,16 @@ async def manana_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     disponibles = [
         r for r in registros
-        if not r["destinatario"]
+        if not r.get("cerrado")
         and r["fecha_dt"] and r["fecha_dt"].date() == manana.date()
-        and r["venc_dt"] and r["venc_dt"] >= hoy
+        and r["fecha_dt"] and r["fecha_dt"] >= hoy
     ]
 
     if not disponibles:
         await msg.edit_text(f"✅ No hay cheques que se habiliten mañana ({manana.strftime('%d/%m/%Y')}).", parse_mode="Markdown")
         return
 
-    disponibles.sort(key=lambda x: x["venc_dt"])
+    disponibles.sort(key=lambda x: x["fecha_dt"])
     total = sum(p["importe"] for p in disponibles)
 
     echeq = [p for p in disponibles if p["tipo"] == "ECHEQ"]
@@ -869,18 +891,18 @@ async def manana_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if echeq:
         lineas.append(f"💻 *ECHEQ — {len(echeq)} cheques — ${sum(p['importe'] for p in echeq):,.0f}*")
         for p in echeq:
-            dias_venc = (p["venc_dt"] - hoy).days
+            dias_venc = (p["fecha_dt"] - hoy).days
             cuit = p["cuit"]
-            lineas.append(f"• *{p['titular'][:28]}* | ${p['importe']:,.0f} | Vence: {p['vencimiento']} ({dias_venc}d) | {p['cliente']}")
+            lineas.append(f"• *{p['titular'][:28]}* | ${p['importe']:,.0f} | Se libera: {p["fecha"]} ({dias_venc}d) | {p['cliente']}")
             if cuit:
                 lineas.append(f"  👉 /evaluar {cuit}")
 
     if fisicos:
         lineas.append(f"\n📄 *FÍSICOS — {len(fisicos)} cheques — ${sum(p['importe'] for p in fisicos):,.0f}*")
         for p in fisicos:
-            dias_venc = (p["venc_dt"] - hoy).days
+            dias_venc = (p["fecha_dt"] - hoy).days
             cuit = p["cuit"]
-            lineas.append(f"• *{p['titular'][:28]}* | ${p['importe']:,.0f} | Vence: {p['vencimiento']} ({dias_venc}d) | {p['cliente']}")
+            lineas.append(f"• *{p['titular'][:28]}* | ${p['importe']:,.0f} | Se libera: {p["fecha"]} ({dias_venc}d) | {p['cliente']}")
             if cuit:
                 lineas.append(f"  👉 /evaluar {cuit}")
 
@@ -907,32 +929,32 @@ async def alerta_matutina(context, target_chat_id=None):
         # Habilitados hoy
         hoy_list = [
             r for r in registros
-            if not r["destinatario"]
+            if not r.get("cerrado")
             and r["fecha_dt"] and r["fecha_dt"].date() == hoy.date()
-            and r["venc_dt"] and r["venc_dt"] >= hoy
+            and r["fecha_dt"] and r["fecha_dt"] >= hoy
         ]
 
         # Habilitados mañana
         manana_list = [
             r for r in registros
-            if not r["destinatario"]
+            if not r.get("cerrado")
             and r["fecha_dt"] and r["fecha_dt"].date() == manana.date()
-            and r["venc_dt"] and r["venc_dt"] >= hoy
+            and r["fecha_dt"] and r["fecha_dt"] >= hoy
         ]
 
         # Vencen esta semana sin destinatario
         vencen_semana = [
             r for r in registros
-            if not r["destinatario"]
-            and r["venc_dt"]
-            and hoy <= r["venc_dt"] <= semana
+            if not r.get("cerrado")
+            and r["fecha_dt"]
+            and hoy <= r["fecha_dt"] <= semana
         ]
 
         # Total cartera pendiente
         total_cartera = sum(
             r["importe"] for r in registros
-            if not r["destinatario"]
-            and r["venc_dt"] and r["venc_dt"] >= hoy
+            if not r.get("cerrado")
+            and r["fecha_dt"] and r["fecha_dt"] >= hoy
         )
 
         # Construir mensaje
@@ -957,12 +979,12 @@ async def alerta_matutina(context, target_chat_id=None):
 
         if vencen_semana:
             total_vencen = sum(p["importe"] for p in vencen_semana)
-            urgentes = [p for p in vencen_semana if (p["venc_dt"] - hoy).days <= 2]
+            urgentes = [p for p in vencen_semana if (p["fecha_dt"] - hoy).days <= 2]
             lineas.append(f"\n⚠️ *Vencen esta semana sin depositar:* {len(vencen_semana)} — ${total_vencen:,.0f}")
             if urgentes:
                 lineas.append(f"🔴 *URGENTE ({len(urgentes)} vencen en 2 días):*")
                 for p in urgentes:
-                    dias = (p["venc_dt"] - hoy).days
+                    dias = (p["fecha_dt"] - hoy).days
                     lineas.append(f"   • {p['titular'][:25]} | ${p['importe']:,.0f} | Vence en {dias}d")
 
         lineas.append(f"\n💰 *Cartera total pendiente:* ${total_cartera:,.0f}")
@@ -973,7 +995,7 @@ async def alerta_matutina(context, target_chat_id=None):
                     "Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"]
         por_mes = defaultdict(float)
         for r in registros:
-            if r.get("destinatario"):
+            if r.get("cerrado"):
                 continue
             f_dt = r.get("fecha_dt")
             if not f_dt or f_dt < hoy:
@@ -997,6 +1019,80 @@ async def alerta_matutina(context, target_chat_id=None):
         )
     except Exception as e:
         print(f"Error en alerta matutina: {e}")
+
+
+# ─────────────────────────────────────────────
+# ALERTA CHEQUES EN LA CALLE — 11:00 AR
+# ─────────────────────────────────────────────
+async def alerta_cheques_calle(context, target_chat_id=None):
+    """Cheques con estado OJO (más de 1 día en la calle sin novedades).
+    Se ejecuta automáticamente todos los días a las 11:00 hora Argentina.
+    """
+    try:
+        registros = await leer_cheques_sheet()
+        if not registros:
+            return
+
+        # Cheques con alerta OJO (col K con fórmula o col J)
+        en_ojo = [r for r in registros if r.get("alerta_ojo") and not r.get("rechazado")]
+
+        if not en_ojo:
+            # Si es invocación manual desde comando, avisar; si es automática, callar
+            if target_chat_id:
+                await context.bot.send_message(
+                    chat_id=target_chat_id,
+                    text="✅ No hay cheques con alerta OJO en este momento.",
+                )
+            return
+
+        # Ordenar por cliente y luego por importe descendente
+        en_ojo.sort(key=lambda x: (x.get("cliente", ""), -x.get("importe", 0)))
+
+        total = sum(r["importe"] for r in en_ojo)
+
+        lineas = [f"🚨 *CHEQUES EN LA CALLE — REVISAR*"]
+        lineas.append(f"_Más de 1 día sin novedades_\n")
+        lineas.append(f"📊 {len(en_ojo)} cheques — *${total:,.0f}*\n")
+
+        for r in en_ojo:
+            dias = r.get("dias_en_calle", "")
+            # Si "dias" es un número, mostrarlo; si es "OJO", decir "hace días"
+            if dias.isdigit():
+                dias_txt = f"en la calle hace {dias} días"
+            else:
+                dias_txt = "en la calle hace más de 1 día"
+
+            titular = r.get("titular", "-")[:30]
+            importe = r.get("importe", 0)
+            numero = r.get("numero", "")
+            cliente = r.get("cliente", "")
+            tenencia = r.get("tenencia", "")
+
+            lineas.append(f"📄 *{titular}* | ${importe:,.0f}")
+            detalles = []
+            if numero:
+                detalles.append(f"Nº `{numero}`")
+            if cliente:
+                detalles.append(f"🧑‍💼 {cliente}")
+            if tenencia:
+                detalles.append(f"📍 {tenencia}")
+            if detalles:
+                lineas.append("   " + " | ".join(detalles))
+            lineas.append(f"   ⏱️ {dias_txt}")
+            lineas.append("")
+
+        texto = "\n".join(lineas)
+        # Cortar si es muy largo
+        if len(texto) > 3800:
+            texto = texto[:3800] + "\n\n_...lista truncada_"
+
+        await context.bot.send_message(
+            chat_id=target_chat_id if target_chat_id else GRUPO_PERMITIDO,
+            text=texto,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        print(f"Error en alerta cheques calle: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -1425,7 +1521,7 @@ async def buscar_cmd(update, context):
         destinatario = r.get("destinatario", "").strip()
         if destinatario:
             estado_dep = f"✅ DEPOSITADO en {destinatario}"
-        elif r.get("venc_dt") and r["venc_dt"] < hoy:
+        elif r.get("fecha_dt") and r["fecha_dt"] < hoy:
             estado_dep = "🔴 VENCIDO — sin depositar"
         else:
             estado_dep = "⚠️ PENDIENTE de depósito"
@@ -1481,9 +1577,9 @@ async def buscar_cmd(update, context):
 
     # ───── MÚLTIPLES RESULTADOS → RESUMEN + LISTA ─────
     # Separar pendientes y depositados
-    pendientes = [r for r in encontrados if not r.get("destinatario") and r.get("venc_dt") and r["venc_dt"] >= hoy]
-    depositados = [r for r in encontrados if r.get("destinatario")]
-    vencidos = [r for r in encontrados if not r.get("destinatario") and r.get("venc_dt") and r["venc_dt"] < hoy]
+    pendientes = [r for r in encontrados if not r.get("cerrado") and r.get("fecha_dt") and r["fecha_dt"] >= hoy]
+    depositados = [r for r in encontrados if r.get("cerrado")]
+    vencidos = [r for r in encontrados if not r.get("cerrado") and r.get("fecha_dt") and r["fecha_dt"] < hoy]
 
     total_pendiente = sum(r["importe"] for r in pendientes)
     total_depositado = sum(r["importe"] for r in depositados)
@@ -1539,6 +1635,13 @@ async def buenos_dias_cmd(update, context):
     await update.message.reply_text("☀️ Generando reporte matutino...")
     await alerta_matutina(context, target_chat_id=update.effective_chat.id)
 
+
+async def en_la_calle_cmd(update, context):
+    """Dispara manualmente la alerta de cheques en la calle con OJO."""
+    if not await check_acceso(update): return
+    await update.message.reply_text("🚨 Buscando cheques en la calle...")
+    await alerta_cheques_calle(context, target_chat_id=update.effective_chat.id)
+
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
@@ -1567,6 +1670,13 @@ def main():
         time=dtime(hour=11, minute=0, second=0),  # 8hs Argentina (UTC-3)
         days=(0, 1, 2, 3, 4, 5, 6)  # todos los días
     )
+    # Alerta cheques en la calle (OJO) — 11hs Argentina (UTC-3 = 14:00 UTC)
+    app.job_queue.run_daily(
+        alerta_cheques_calle,
+        time=dtime(hour=14, minute=0, second=0),  # 11hs Argentina (UTC-3)
+        days=(0, 1, 2, 3, 4, 5, 6)  # todos los días
+    )
+    app.add_handler(CommandHandler("en_la_calle", en_la_calle_cmd))
     app.add_handler(CommandHandler("hoy", cheques_hoy_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
