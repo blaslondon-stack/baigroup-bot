@@ -6,12 +6,6 @@ import asyncio
 import anthropic
 from datetime import datetime, timedelta, time as dtime
 
-# Playwright para scraping BCRA con cheques rechazados
-try:
-    from playwright.async_api import async_playwright
-    PLAYWRIGHT_AVAILABLE = True
-except ImportError:
-    PLAYWRIGHT_AVAILABLE = False
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -21,6 +15,7 @@ from notify_api import start_notify_api
 # TOKENS — leer SIEMPRE de env vars (nunca hardcodear)
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+INDICADORES_API_KEY = os.environ.get("INDICADORES_API_KEY", "")
 
 # SEGURIDAD — solo responde en este grupo y a este usuario
 GRUPO_PERMITIDO = -5265832156
@@ -41,215 +36,217 @@ async def check_acceso(update: Update) -> bool:
 cartera = {}
 
 # ─────────────────────────────────────────────
-# BCRA API
+# INDICADORES.AR API — reemplaza BCRA
+# Devuelve situación BCRA + cheques rechazados
+# + score + apoc + repsal en una sola llamada
 # ─────────────────────────────────────────────
-async def consultar_bcra(cuit: str) -> dict:
+async def consultar_indicadores(cuit: str) -> dict:
+    """Consulta indicadores.ar y retorna el JSON completo.
+    Formato de retorno:
+      {"ok": True, "data": {...}}  o  {"ok": False, "error": "..."}
+    """
     cuit_limpio = re.sub(r"[-\s]", "", cuit)
-    url = f"https://api.bcra.gob.ar/centraldedeudores/v1.0/deudas/{cuit_limpio}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Accept": "application/json",
-        "Accept-Language": "es-AR,es;q=0.9",
-    }
-    # Intentar 2 veces — inmediato + 1 reintento rápido
-    ultimo_error = ""
-    for intento in range(2):
-        try:
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(10.0, connect=5.0),
-                verify=False,
-                follow_redirects=True
-            ) as client:
-                r = await client.get(url, headers=headers)
-                if r.status_code == 200:
-                    return {"ok": True, "data": r.json()}
-                elif r.status_code == 404:
-                    return {"ok": False, "error": "CUIT sin deuda registrada en Central de Deudores"}
-                else:
-                    ultimo_error = f"HTTP {r.status_code}"
-        except Exception as e:
-            ultimo_error = str(e)
-        if intento == 0:
-            await asyncio.sleep(1)
-    return {"ok": False, "error": f"Sin conexión con BCRA: {ultimo_error}"}
-
-async def consultar_cheques_rechazados(cuit: str) -> dict:
-    cuit_limpio = re.sub(r"[-\s]", "", cuit)
-    url = f"https://api.bcra.gob.ar/centraldedeudores/v1.0/cheques/{cuit_limpio}/rechazados"
+    url = f"https://indicadores.ar/v1/empresa?cuit={cuit_limpio}"
+    headers = {"api-key": INDICADORES_API_KEY}
     try:
         async with httpx.AsyncClient(timeout=15, verify=False, follow_redirects=True) as client:
-            r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
-            if r.status_code == 200:
-                data = r.json()
-                cheques = []
-                results = data.get("results", {})
-                if isinstance(results, dict):
-                    cheques = results.get("cheques", [])
-                elif isinstance(results, list):
-                    cheques = results
-                if not cheques:
-                    cheques = data.get("cheques", [])
-                return {"ok": True, "cheques": cheques}
-            else:
-                return {"ok": True, "cheques": []}
-    except:
-        return {"ok": True, "cheques": []}
+            r = await client.get(url, headers=headers)
+        if r.status_code == 200:
+            return {"ok": True, "data": r.json()}
+        elif r.status_code == 404:
+            return {"ok": False, "error": "CUIT no encontrado en indicadores.ar"}
+        elif r.status_code == 401:
+            return {"ok": False, "error": "API key de indicadores.ar inválida"}
+        else:
+            return {"ok": False, "error": f"indicadores.ar HTTP {r.status_code}"}
+    except Exception as e:
+        return {"ok": False, "error": f"Error consultando indicadores.ar: {e}"}
 
 # ─────────────────────────────────────────────
-# CLAUDE ANALYSIS
+# CLAUDE ANALYSIS — usa estructura indicadores.ar
 # ─────────────────────────────────────────────
-async def analizar_con_claude(cuit: str, bcra_data: dict, cheques_data: dict) -> str:
+async def analizar_con_claude(cuit: str, ind_data: dict) -> str:
+    """Analiza los datos de indicadores.ar con Claude.
+    ind_data es el JSON completo devuelto por indicadores.ar.
+    """
     if not ANTHROPIC_API_KEY:
-        return analizar_sin_claude(cuit, bcra_data, cheques_data)
-    
+        return analizar_sin_claude(cuit, ind_data)
+
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        
-        # Extraer flags críticos de la estructura BCRA
-        results_data = bcra_data.get("results", {})
-        periodos = results_data.get("periodos", [])
-        flags_detectados = []
-        for periodo in periodos:
-            for entidad in periodo.get("entidades", []):
-                nombre_e = entidad.get("entidad", "")
-                if entidad.get("refinanciaciones"):
-                    flags_detectados.append(f"⚠️ {nombre_e}: refinanciaciones activas")
-                if entidad.get("recategorizacionOblig"):
-                    flags_detectados.append(f"🔴 {nombre_e}: recategorización obligatoria por BCRA")
-                if entidad.get("situacionJuridica"):
-                    flags_detectados.append(f"🔴 {nombre_e}: situación jurídica (concurso/quiebra)")
-                if entidad.get("irrecDisposicionTecnica"):
-                    flags_detectados.append(f"🔴 {nombre_e}: irrecuperable por disposición técnica")
-                if entidad.get("procesoJud"):
-                    flags_detectados.append(f"🔴 {nombre_e}: proceso judicial activo")
-                if entidad.get("enRevision"):
-                    flags_detectados.append(f"⚠️ {nombre_e}: clasificación en revisión")
-                dias = entidad.get("diasAtrasoPago", 0) or 0
-                if dias > 0:
-                    flags_detectados.append(f"⚠️ {nombre_e}: {dias} días de atraso")
 
-        flags_txt = "\n".join(flags_detectados) if flags_detectados else "Ninguno"
+        razon = ind_data.get("razon_social", "Desconocido")
+        bcra = ind_data.get("deudas_bcra") or {}
+        cheques_obj = ind_data.get("cheques_rechazados") or {}
+        apoc = ind_data.get("apoc") or {}
+        repsal = ind_data.get("sanciones_laborales_repsal") or {}
 
-        prompt = f"""Sos el agente de crédito de BAI Group SA, financiera argentina especializada en descuento de cheques.
+        # Flags automáticos
+        flags = []
+        sit_principal = bcra.get("situacion_principal", 0)
+        if sit_principal >= 4:
+            flags.append(f"🔴 Situación {sit_principal} — {bcra.get('situacion_principal_label', '')}")
+        elif sit_principal == 3:
+            flags.append(f"🟠 Situación 3 — Con problemas graves")
+        elif sit_principal == 2:
+            flags.append(f"🟡 Situación 2 — Con seguimiento")
 
-Analizá la siguiente información del BCRA para el CUIT {cuit}.
+        for ent in bcra.get("entidades_detalle", []):
+            if ent.get("en_juicio"):
+                flags.append(f"🔴 {ent['entidad']}: en juicio")
+            if ent.get("refinanciado"):
+                flags.append(f"⚠️ {ent['entidad']}: refinanciado")
+            if ent.get("dias_atraso", 0) > 0:
+                flags.append(f"⚠️ {ent['entidad']}: {ent['dias_atraso']}d de atraso")
 
-DATOS BCRA COMPLETOS:
-{json.dumps(bcra_data, ensure_ascii=False, indent=2)}
+        impagos = cheques_obj.get("impagos", 0)
+        total_cheques = cheques_obj.get("total", 0)
+        if impagos > 0:
+            flags.append(f"🔴 {impagos} cheques rechazados IMPAGAS (de {total_cheques} total)")
+        elif total_cheques > 0:
+            flags.append(f"🟡 {total_cheques} cheques rechazados — todos pagados")
 
-FLAGS CRÍTICOS DETECTADOS AUTOMÁTICAMENTE:
+        if apoc.get("incluido"):
+            flags.append("🔴 APOC: incluido en padrón AFIP de facturas apócrifas")
+        if repsal.get("total", 0) > 0:
+            flags.append(f"⚠️ REPSAL: {repsal['total']} sanciones laborales")
+
+        flags_txt = "\n".join(flags) if flags else "Ninguno"
+
+        # Resumen cheques para el prompt
+        cheques_detalle = cheques_obj.get("detalle", [])[:8]
+
+        prompt = f"""Sos el agente de crédito de BAI Group SA, financiera argentina especializada en descuento de cheques (ECHEQs y físicos).
+
+Analizá la siguiente información de indicadores.ar para el CUIT {cuit} ({razon}).
+
+SITUACIÓN BCRA (período {bcra.get('periodo', '-')}):
+- Situación principal: {sit_principal} — {bcra.get('situacion_principal_label', '-')}
+- Deuda total: ${bcra.get('deuda_total_miles', 0):,} miles
+- Entidades: {bcra.get('entidades', 0)}
+{json.dumps(bcra.get('entidades_detalle', []), ensure_ascii=False, indent=2)}
+
+CHEQUES RECHAZADOS:
+- Total: {total_cheques} | Impagas: {impagos}
+{json.dumps(cheques_detalle, ensure_ascii=False, indent=2)}
+
+APOC (facturas apócrifas AFIP): {"SÍ incluido 🔴" if apoc.get("incluido") else "No incluido ✅"}
+REPSAL (sanciones laborales): {repsal.get("total", 0)} registros
+
+FLAGS DETECTADOS AUTOMÁTICAMENTE:
 {flags_txt}
 
-CHEQUES RECHAZADOS EN API ({len(cheques_data.get("cheques", []))} registros):
-{json.dumps(cheques_data.get("cheques", [])[:5], ensure_ascii=False, indent=2)}
-
 SEMÁFORO BAI GROUP:
-✅ APROBAR: Sit 1 en todas las entidades, sin flags, sin refinanciaciones
-🟡 CON CONDICIONES: Sit 1 con algún flag menor (enRevision, días atraso leve) o Sit 2 con buen historial
-🟠 ALTO RIESGO: Sit 2 con flags, o Sit 1 con refinanciaciones/recategorización
-❌ RECHAZAR: Sit 3+ / situaciónJuridica / procesoJud / irrecDisposicionTecnica / recategorizacionOblig
+✅ APROBAR: Sit 1, sin cheques impagas, sin APOC, sin juicios
+🟡 CON CONDICIONES: Sit 1-2 con alertas menores o cheques pagados
+🟠 ALTO RIESGO: Sit 2 con flags, cheques impagas recientes, o APOC
+❌ RECHAZAR: Sit 3+ / en juicio / cheques SIN FONDOS impagas recientes / APOC activo
 
-CRITERIOS ADICIONALES:
-- Refinanciaciones activas = empresa en dificultades, aumentar tasa o rechazar según monto
-- recategorizacionOblig = el BCRA la forzó a bajar categoría, muy negativo
-- Deuda con 3+ entidades simultáneas = analizar concentración
-- Monto total >$500M = exposición alta
-- Mostrar montos en millones (ej: $27,63M) no en miles, exigir mayor tasa
+CRITERIOS:
+- Montos siempre en millones: $27,63M (no en miles)
+- Deuda >$500M = exposición alta, exigir mayor tasa
+- 3+ entidades simultáneas = analizar concentración
+- Cheques impagas recientes (<6 meses) = rechazo casi automático
 
-Respondé en este formato:
+Respondé en este formato exacto:
 
-🏢 *LIBRADOR:* [nombre]
+🏢 *LIBRADOR:* {razon}
 🔢 *CUIT:* {cuit}
 
-📊 *SITUACIÓN ACTUAL:*
-[Cada entidad: nombre | Sit X | $monto | flags si tiene]
+📊 *SITUACIÓN BCRA ({bcra.get('periodo', '-')}):*
+[Cada entidad: nombre | Sit X | $montoM | flags]
 
-🚨 *FLAGS DETECTADOS:*
-[Lista de flags o "Sin flags críticos ✅"]
+🚨 *CHEQUES RECHAZADOS:*
+[Cantidad total, impagas, últimos rechazos con fecha/monto/causal]
+[Si no hay: "Sin cheques rechazados ✅"]
+
+⚠️ *FLAGS DETECTADOS:*
+[Lista concreta o "Sin flags críticos ✅"]
 
 💰 *EXPOSICIÓN TOTAL:*
-[Suma de deuda y cantidad de entidades]
+[$totalM en X entidades]
 
 🎯 *RECOMENDACIÓN:*
 [✅ APROBAR / 🟡 CON CONDICIONES / 🟠 ALTO RIESGO / ❌ RECHAZAR]
-[Justificación concreta en 2-3 líneas]
+[Justificación en 2-3 líneas concretas]
 
 📋 *CONDICIONES:*
-[Tasa sugerida, monto máximo, o "Sin condiciones adicionales"]"""
+[Tasa sugerida, monto máximo o "Sin condiciones adicionales"]"""
 
         response = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=1000,
+            max_tokens=1200,
             messages=[{"role": "user", "content": prompt}]
         )
         return response.content[0].text
     except Exception as e:
-        return analizar_sin_claude(cuit, bcra_data, cheques_data)
+        return analizar_sin_claude(cuit, ind_data)
 
-def analizar_sin_claude(cuit: str, bcra_data: dict, cheques_data: dict) -> str:
-    """Análisis básico sin Claude como fallback"""
+
+def analizar_sin_claude(cuit: str, ind_data: dict) -> str:
+    """Análisis básico sin Claude como fallback — usa estructura indicadores.ar"""
     try:
-        results = bcra_data.get("results", {})
-        nombre = results.get("denominacion", "Desconocido")
-        periodos = results.get("periodos", [])
-        
-        # Obtener situación más reciente
-        sit_actual = 1
+        razon = ind_data.get("razon_social", "Desconocido")
+        bcra = ind_data.get("deudas_bcra") or {}
+        cheques_obj = ind_data.get("cheques_rechazados") or {}
+
+        sit = bcra.get("situacion_principal", 0)
+        sit_label = bcra.get("situacion_principal_label", "-")
+        deuda = bcra.get("deuda_total_miles", 0)
+        periodo = bcra.get("periodo", "-")
+
+        emoji_sit = {1: "🟢", 2: "🟡", 3: "🟠", 4: "🔴", 5: "🔴"}.get(sit, "⚪")
+
         entidades_lineas = []
-        alertas = []
-        
-        for periodo in periodos[:3]:  # últimos 3 periodos
-            for entidad in periodo.get("entidades", []):
-                sit = entidad.get("situacion", 1)
-                monto = entidad.get("monto", 0)
-                nombre_entidad = entidad.get("entidad", "")
-                if sit > sit_actual:
-                    sit_actual = sit
-                monto_m = monto / 1000
-                if monto_m >= 1:
-                    monto_fmt = f"${monto_m:,.2f}M"
-                else:
-                    monto_fmt = f"${monto:,.0f}k"
-                entidades_lineas.append(f"• {nombre_entidad}: Sit. {sit} | {monto_fmt}")
-        
-        # Cheques rechazados
-        cheques = cheques_data.get("cheques", [])
-        if cheques:
-            # Contar solo SIN FONDOS vs otros
-            sin_fondos = [c for c in cheques if "FONDOS" in str(c).upper()]
-            total = len(cheques)
-            alertas.append(f"🔴 {total} cheque(s) rechazado(s) — {len(sin_fondos)} por SIN FONDOS")
-            # Mostrar los 3 más recientes
-            for c in cheques[:3]:
-                fecha = c.get("fechaRechazo", c.get("fecha", ""))
-                monto = c.get("monto", "")
-                causal = c.get("causal", c.get("causa", ""))
-                alertas.append(f"  → {fecha} | ${monto:,} | {causal}")
-        
+        for ent in bcra.get("entidades_detalle", []):
+            e_sit = ent.get("situacion", 1)
+            e_emoji = {1: "🟢", 2: "🟡", 3: "🟠", 4: "🔴", 5: "🔴"}.get(e_sit, "⚪")
+            e_deuda = ent.get("deuda_miles", 0)
+            e_fmt = f"${e_deuda/1000:,.2f}M" if e_deuda >= 1000 else f"${e_deuda:,}k"
+            flags = []
+            if ent.get("en_juicio"): flags.append("en juicio")
+            if ent.get("refinanciado"): flags.append("refinanciado")
+            flag_txt = f" ⚠️ {', '.join(flags)}" if flags else ""
+            entidades_lineas.append(f"  {e_emoji} {ent['entidad']}: Sit {e_sit} | {e_fmt}{flag_txt}")
+
+        # Cheques
+        total_ch = cheques_obj.get("total", 0)
+        impagos = cheques_obj.get("impagos", 0)
+        if total_ch > 0:
+            cheques_txt = f"🚨 {total_ch} rechazados — {impagos} impagas"
+            for ch in cheques_obj.get("detalle", [])[:4]:
+                monto = float(ch.get("monto", 0))
+                monto_fmt = f"${monto/1_000_000:,.2f}M" if monto >= 1_000_000 else f"${monto/1000:,.0f}k"
+                pagado = "✅" if ch.get("pagado") else "❌"
+                cheques_txt += f"\n  {pagado} {ch['fecha']} {monto_fmt} — {ch['causal']}"
+        else:
+            cheques_txt = "Sin cheques rechazados ✅"
+
         # Semáforo
-        if sit_actual == 1 and not cheques:
-            semaforo = "✅ APROBAR"
-        elif sit_actual == 2 or (sit_actual == 1 and cheques):
+        if impagos > 0 or sit >= 4:
+            semaforo = "❌ RECHAZAR"
+        elif sit == 3 or (impagos == 0 and total_ch > 0):
+            semaforo = "🟠 ALTO RIESGO"
+        elif sit == 2:
             semaforo = "🟡 APROBAR CON CONDICIONES"
         else:
-            semaforo = "❌ RECHAZAR"
+            semaforo = "✅ APROBAR"
 
-        entidades_txt = "\n".join(entidades_lineas) if entidades_lineas else "Sin deuda reportada"
-        alertas_txt = "\n".join(alertas) if alertas else "Sin alertas"
+        deuda_fmt = f"${deuda/1000:,.2f}M" if deuda >= 1000 else f"${deuda:,}k"
+        ents_txt = "\n".join(entidades_lineas) if entidades_lineas else "  Sin deuda reportada"
 
-        return f"""🏢 *LIBRADOR:* {nombre}
-🔢 *CUIT:* {cuit}
-
-📊 *SITUACIÓN ACTUAL:*
-{entidades_txt}
-
-🚨 *ALERTAS:*
-{alertas_txt}
-
-🎯 *RECOMENDACIÓN:*
-{semaforo}"""
-    except:
-        return f"✅ Consulta BCRA exitosa para CUIT {cuit}\nRevisá los datos manualmente."
+        return (
+            f"🏢 *LIBRADOR:* {razon}\n"
+            f"🔢 *CUIT:* {cuit}\n\n"
+            f"📊 *SITUACIÓN BCRA ({periodo}):*\n"
+            f"{emoji_sit} Sit {sit} — {sit_label}\n"
+            f"{ents_txt}\n\n"
+            f"🚨 *CHEQUES RECHAZADOS:*\n{cheques_txt}\n\n"
+            f"💰 *EXPOSICIÓN:* {deuda_fmt} en {bcra.get('entidades', 0)} entidades\n\n"
+            f"🎯 *RECOMENDACIÓN:* {semaforo}"
+        )
+    except Exception:
+        return f"✅ Consulta exitosa para CUIT {cuit}\nRevisá los datos manualmente."
 
 # ─────────────────────────────────────────────
 # CALCULAR DESCUENTO
@@ -304,30 +301,35 @@ async def evaluar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     cuit = re.sub(r"[-\s]", "", context.args[0])
-    msg = await update.message.reply_text(f"🔍 Consultando BCRA para CUIT `{cuit}`...", parse_mode="Markdown")
+    msg = await update.message.reply_text(
+        f"🔍 Consultando indicadores.ar para CUIT `{cuit}`...",
+        parse_mode="Markdown"
+    )
 
-    # Consultar BCRA y cartera simultáneamente
-    bcra, cheques, registros = await asyncio.gather(
-        consultar_bcra(cuit),
-        consultar_cheques_rechazados(cuit),
+    # Consultar indicadores.ar y cartera simultáneamente
+    ind_result, registros = await asyncio.gather(
+        consultar_indicadores(cuit),
         leer_cheques_sheet()
     )
 
-    if not bcra["ok"]:
-        await msg.edit_text(f"⚠️ *BCRA:* {bcra['error']}\n\nEl CUIT puede no tener deuda registrada en el sistema financiero.", parse_mode="Markdown")
+    if not ind_result["ok"]:
+        await msg.edit_text(
+            f"⚠️ {ind_result['error']}\n\nEl CUIT puede no estar registrado o sin actividad.",
+            parse_mode="Markdown"
+        )
         return
 
     await msg.edit_text("🤖 Analizando con IA...", parse_mode="Markdown")
 
-    # Analizar
-    analisis = await analizar_con_claude(cuit, bcra["data"], cheques)
+    ind_data = ind_result["data"]
+    analisis = await analizar_con_claude(cuit, ind_data)
 
     # Verificar en cartera del Sheet
     hoy = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     en_cartera = [
         r for r in registros
         if r.get("cuit", "").strip() == cuit
-        and r.get("venc_dt") and r["venc_dt"] >= hoy
+        and r.get("fecha_dt") and r["fecha_dt"] >= hoy
         and not r.get("cerrado")
     ]
 
@@ -335,7 +337,7 @@ async def evaluar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_cartera_cuit = sum(r["importe"] for r in en_cartera)
         total_cartera_general = sum(
             r["importe"] for r in registros
-            if r.get("venc_dt") and r["venc_dt"] >= hoy
+            if r.get("fecha_dt") and r["fecha_dt"] >= hoy
             and not r.get("cerrado")
         )
         pct = (total_cartera_cuit / total_cartera_general * 100) if total_cartera_general > 0 else 0
@@ -348,7 +350,6 @@ async def evaluar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if alerta_conc:
             cartera_txt += f"\n• {alerta_conc}"
-
         analisis += cartera_txt
 
     await msg.edit_text(analisis, parse_mode="Markdown")
@@ -837,7 +838,9 @@ async def semana_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         titular = p["titular"][:28]
         dias_venc = (p["fecha_dt"] - hoy).days if p.get("fecha_dt") else 0
         lineas = [f"⚠️ *{titular}* | ${p['importe']:,.0f}"]
-        lineas.append(f"   🟢 Disponible: {p['fecha']} | Se libera: {p["fecha"]} ({dias_venc}d) | {p['cliente'][:20]}")
+        fecha_lib = p['fecha']
+        cliente_short = p['cliente'][:20]
+        lineas.append(f"   🟢 Disponible: {fecha_lib} | Se libera: {fecha_lib} ({dias_venc}d) | {cliente_short}")
         if cuit:
             lineas.append(f"   👉 /evaluar {cuit}")
         return "\n".join(lineas)
@@ -946,7 +949,8 @@ async def manana_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for p in echeq:
             dias_venc = (p["fecha_dt"] - hoy).days
             cuit = p["cuit"]
-            lineas.append(f"• *{p['titular'][:28]}* | ${p['importe']:,.0f} | Se libera: {p["fecha"]} ({dias_venc}d) | {p['cliente']}")
+            fecha_p = p['fecha']
+            lineas.append(f"• *{p['titular'][:28]}* | ${p['importe']:,.0f} | Se libera: {fecha_p} ({dias_venc}d) | {p['cliente']}")
             if cuit:
                 lineas.append(f"  👉 /evaluar {cuit}")
 
@@ -955,7 +959,8 @@ async def manana_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for p in fisicos:
             dias_venc = (p["fecha_dt"] - hoy).days
             cuit = p["cuit"]
-            lineas.append(f"• *{p['titular'][:28]}* | ${p['importe']:,.0f} | Se libera: {p["fecha"]} ({dias_venc}d) | {p['cliente']}")
+            fecha_p = p['fecha']
+            lineas.append(f"• *{p['titular'][:28]}* | ${p['importe']:,.0f} | Se libera: {fecha_p} ({dias_venc}d) | {p['cliente']}")
             if cuit:
                 lineas.append(f"  👉 /evaluar {cuit}")
 
@@ -1144,212 +1149,9 @@ async def alerta_cheques_calle(context, target_chat_id=None):
         print(f"Error en alerta cheques calle: {e}")
 
 
-# ─────────────────────────────────────────────
-# BCRA SCRAPING CON PLAYWRIGHT (cheques rechazados)
-# ─────────────────────────────────────────────
-async def consultar_bcra_completo(cuit: str) -> dict:
-    """
-    Consulta el BCRA web con Playwright para obtener deudas + cheques rechazados.
-    Resuelve el Cloudflare Turnstile automáticamente.
-    """
-    cuit_limpio = re.sub(r"[-\s]", "", cuit)
-    
-    if not PLAYWRIGHT_AVAILABLE:
-        return {"ok": False, "error": "Playwright no disponible"}
-    
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-accelerated-2d-canvas",
-                    "--disable-gpu",
-                    "--window-size=1280,800",
-                ]
-            )
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 800}
-            )
-            page = await context.new_page()
-            
-            # Navegar al BCRA
-            await page.goto(
-                f"https://www.bcra.gob.ar/deudores/?cuit={cuit_limpio}",
-                wait_until="domcontentloaded",
-                timeout=30000
-            )
-            
-            # Esperar a que el JS genere el token y redirija
-            # La URL cambia de ?cuit=X a ?cuit=X&ts=Y&token=Z
-            try:
-                await page.wait_for_url(
-                    lambda url: "token=" in url,
-                    timeout=15000
-                )
-            except:
-                pass
-            
-            # Esperar a que cargue el contenido dinámico (cheques rechazados)
-            try:
-                await page.wait_for_selector(
-                    "text=Central de cheques rechazados",
-                    timeout=15000
-                )
-            except:
-                # Si no aparece cheques, esperar a que aparezca al menos el nombre
-                try:
-                    await page.wait_for_selector(
-                        "#deudores-resultados",
-                        timeout=10000
-                    )
-                except:
-                    await page.wait_for_timeout(5000)
-            
-            # Esperar un poco más para asegurar carga completa
-            await page.wait_for_timeout(2000)
-            
-            # Extraer el texto completo de la página
-            texto = await page.inner_text("body")
-            url_final = page.url
-            
-            await browser.close()
-            
-            return {
-                "ok": True,
-                "texto": texto,
-                "url": url_final,
-                "cuit": cuit_limpio
-            }
-    except Exception as e:
-        return {"ok": False, "error": f"Error Playwright: {str(e)}"}
-
-async def analizar_bcra_completo_con_claude(cuit: str, texto_bcra: str) -> str:
-    """Analiza el texto completo del BCRA incluyendo cheques rechazados"""
-    if not ANTHROPIC_API_KEY:
-        return analizar_texto_bcra_basico(cuit, texto_bcra)
-    
-    try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        
-        prompt = f"""Sos el agente de crédito de BAI Group SA, financiera especializada en descuento de cheques.
-
-Analizá el siguiente texto extraído de la web del BCRA para el CUIT {cuit}.
-El texto incluye: situación crediticia, historial 24 meses Y cheques rechazados.
-
-TEXTO DEL BCRA:
-{texto_bcra[:8000]}
-
-POLÍTICA CREDITICIA BAI GROUP:
-- Situación 1 sin alertas → APROBAR
-- Situación 1 con alertas históricas → APROBAR CON CONDICIONES  
-- Situación 2 → APROBAR CON CONDICIONES (tasa mayor)
-- Situación 3 o superior → RECHAZAR
-- Cheques rechazados SIN FONDOS en últimos 6 meses → RECHAZAR
-- Cheques rechazados pagados → Analizar con cuidado
-
-Respondé con este formato:
-
-🏢 *LIBRADOR:* [nombre]
-🔢 *CUIT:* {cuit}
-
-📊 *SITUACIÓN BCRA:*
-[Lista entidades con situación y monto]
-
-🚨 *CHEQUES RECHAZADOS:*
-[Cantidad, montos, causales, si están pagados o no]
-[Si no hay: "Sin cheques rechazados ✅"]
-
-📋 *ALERTAS:*
-[Alertas detectadas o "Sin alertas"]
-
-🎯 *RECOMENDACIÓN:*
-[✅ APROBAR / 🟡 APROBAR CON CONDICIONES / ❌ RECHAZAR]
-[Justificación en 2-3 líneas]"""
-
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1500,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        return response.content[0].text
-    except Exception as e:
-        return analizar_texto_bcra_basico(cuit, texto_bcra)
-
-def analizar_texto_bcra_basico(cuit: str, texto: str) -> str:
-    """Análisis básico del texto del BCRA sin Claude"""
-    import re
-    
-    # Extraer nombre
-    nombre_match = re.search(r'Central de Deudores.*?\n([A-ZÁÉÍÓÚÑ][\w\s\.]+?)\n', texto)
-    nombre = nombre_match.group(1).strip() if nombre_match else "Desconocido"
-    
-    # Detectar situaciones
-    sits = re.findall(r'Situación\s*(\d)', texto)
-    max_sit = max([int(s) for s in sits], default=1) if sits else 1
-    
-    # Detectar cheques rechazados
-    cheques_match = re.search(r'Total cheques rechazados\s+([\d,\.]+)\s+([\d,\.]+)', texto)
-    n_cheques = cheques_match.group(1) if cheques_match else "0"
-    monto_cheques = cheques_match.group(2) if cheques_match else "0"
-    
-    sin_fondos = "SIN FONDOS" in texto
-    
-    # Semáforo
-    if sin_fondos or max_sit >= 3:
-        semaforo = "❌ RECHAZAR"
-    elif max_sit == 2:
-        semaforo = "🟡 APROBAR CON CONDICIONES"
-    else:
-        semaforo = "✅ APROBAR"
-    
-    cheques_txt = f"{n_cheques} cheques por ${monto_cheques}" if n_cheques != "0" else "Sin cheques rechazados ✅"
-    
-    return f"""🏢 *LIBRADOR:* {nombre}
-🔢 *CUIT:* {cuit}
-
-📊 *SITUACIÓN BCRA:* Máxima Sit. {max_sit}
-
-🚨 *CHEQUES RECHAZADOS:* {cheques_txt}
-
-🎯 *RECOMENDACIÓN:*
-{semaforo}"""
-
 async def evaluar_completo(update, context):
-    """Evaluación completa con cheques rechazados via Playwright"""
-    if not await check_acceso(update): return
-    
-    if not context.args:
-        await update.message.reply_text(
-            "❌ Usá: `/evaluar_completo [CUIT]`\nEj: `/evaluar_completo 30718462440`",
-            parse_mode="Markdown"
-        )
-        return
-    
-    cuit = re.sub(r"[-\s]", "", context.args[0])
-    msg = await update.message.reply_text(
-        f"🔍 Consultando BCRA completo para CUIT `{cuit}`...\n_(incluye cheques rechazados — puede tardar 10-15 seg)_",
-        parse_mode="Markdown"
-    )
-    
-    resultado = await consultar_bcra_completo(cuit)
-    
-    if not resultado["ok"]:
-        # Fallback a la API normal
-        await msg.edit_text(f"⚠️ Playwright no disponible: {resultado['error']}\nUsando API básica...", parse_mode="Markdown")
-        bcra = await consultar_bcra(cuit)
-        cheques = await consultar_cheques_rechazados(cuit)
-        if bcra["ok"]:
-            analisis = await analizar_con_claude(cuit, bcra["data"], cheques)
-            await msg.edit_text(analisis, parse_mode="Markdown")
-        return
-    
-    await msg.edit_text("🤖 Analizando con IA...", parse_mode="Markdown")
-    analisis = await analizar_bcra_completo_con_claude(cuit, resultado["texto"])
-    await msg.edit_text(analisis, parse_mode="Markdown")
+    """/evaluar_completo — alias de /evaluar (indicadores.ar ya incluye todo)"""
+    await evaluar(update, context)
 
 
 # ─────────────────────────────────────────────

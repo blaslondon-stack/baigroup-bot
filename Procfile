@@ -1,1 +1,1 @@
-worker: playwright install chromium --with-deps && python3 baigroup_bot.py
+worker: python3 baigroup_bot.py
